@@ -14,6 +14,51 @@ from .model import TextToLatentRFDiT, precompute_freqs_cis
 
 _IR_CACHE_VERSION = 1
 _MAX_DYNAMIC_SEQUENCE_LENGTH = 4096
+_LATENT_SEQUENCE_BUCKETS = (
+    8,
+    12,
+    16,
+    24,
+    32,
+    48,
+    64,
+    96,
+    128,
+    192,
+    256,
+    384,
+    512,
+    768,
+    1024,
+    1536,
+    2048,
+    3072,
+    4096,
+)
+
+
+def _bucket_latent_input(x_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if x_t.ndim != 3 or x_t.shape[1] == 0:
+        raise ValueError(f"Latent input must have shape (B,S,D) with S > 0, got {x_t.shape}.")
+
+    sequence_length = x_t.shape[1]
+    bucket_length = next(
+        (length for length in _LATENT_SEQUENCE_BUCKETS if length >= sequence_length),
+        sequence_length,
+    )
+    latent_mask = torch.zeros(
+        (x_t.shape[0], bucket_length),
+        dtype=torch.bool,
+        device=x_t.device,
+    )
+    latent_mask[:, :sequence_length] = True
+    if bucket_length == sequence_length:
+        return x_t, latent_mask
+
+    padding = x_t.new_zeros(
+        (x_t.shape[0], bucket_length - sequence_length, x_t.shape[2])
+    )
+    return torch.cat((x_t, padding), dim=1), latent_mask
 
 
 def _safe_cache_component(value: object) -> str:
@@ -246,6 +291,7 @@ class _RFDiTExportWrapper(torch.nn.Module):
         self,
         x_t: torch.Tensor,
         t: torch.Tensor,
+        latent_mask: torch.Tensor,
         text_state: torch.Tensor,
         text_mask: torch.Tensor,
         speaker_state: torch.Tensor,
@@ -262,6 +308,7 @@ class _RFDiTExportWrapper(torch.nn.Module):
             speaker_mask=speaker_mask if self.use_speaker else None,
             caption_state=caption_state if self.use_caption else None,
             caption_mask=caption_mask if self.use_caption else None,
+            latent_mask=latent_mask,
             context_kv_cache=None,
         )
 
@@ -278,6 +325,7 @@ class _MeanFlowDiTExportWrapper(torch.nn.Module):
         x_t: torch.Tensor,
         t: torch.Tensor,
         delta_t: torch.Tensor,
+        latent_mask: torch.Tensor,
         text_state: torch.Tensor,
         text_mask: torch.Tensor,
         speaker_state: torch.Tensor,
@@ -295,6 +343,7 @@ class _MeanFlowDiTExportWrapper(torch.nn.Module):
             speaker_mask=speaker_mask if self.use_speaker else None,
             caption_state=caption_state if self.use_caption else None,
             caption_mask=caption_mask if self.use_caption else None,
+            latent_mask=latent_mask,
             context_kv_cache=None,
         )
 
@@ -331,7 +380,7 @@ class OpenVINODiTBackend(_OpenVINOBackendBase):
         return "meanflow_dit.xml" if self.is_meanflow else "rf_dit.xml"
 
     def _supports_dynamic_ir(self, inputs: tuple[torch.Tensor, ...]) -> bool:
-        sequence_indexes = (0, 3, 5, 7) if self.is_meanflow else (0, 2, 4, 6)
+        sequence_indexes = (0, 4, 6, 8) if self.is_meanflow else (0, 3, 5, 7)
         sequence_inputs = tuple(inputs[index] for index in sequence_indexes)
         return all(
             tensor.shape[1] <= _MAX_DYNAMIC_SEQUENCE_LENGTH for tensor in sequence_inputs
@@ -349,9 +398,9 @@ class OpenVINODiTBackend(_OpenVINOBackendBase):
             bool(self.model.cfg.use_caption_condition),
         )
         use_sequence = (
-            (True, False, False, *condition_sequences)
+            (True, False, False, True, *condition_sequences)
             if self.is_meanflow
-            else (True, False, *condition_sequences)
+            else (True, False, True, *condition_sequences)
         )
         example_inputs: list[torch.Tensor] = []
         for index, (tensor, dynamic_sequence) in enumerate(zip(inputs, use_sequence, strict=True)):
@@ -404,10 +453,12 @@ class OpenVINODiTBackend(_OpenVINOBackendBase):
             {0: batch, 1: latent},
             {0: batch},
             {0: batch},
+            {0: batch, 1: latent},
             *condition_shapes,
         ) if self.is_meanflow else (
             {0: batch, 1: latent},
             {0: batch},
+            {0: batch, 1: latent},
             *condition_shapes,
         )
 
@@ -440,6 +491,7 @@ class OpenVINODiTBackend(_OpenVINOBackendBase):
         caption_state: torch.Tensor | None,
         caption_mask: torch.Tensor | None,
     ) -> tuple[torch.Tensor, ...]:
+        x_t, latent_mask = _bucket_latent_input(x_t)
         batch = x_t.shape[0]
         if self.model.cfg.use_speaker_condition_resolved:
             if speaker_state is None or speaker_mask is None:
@@ -464,12 +516,13 @@ class OpenVINODiTBackend(_OpenVINOBackendBase):
         if self.is_meanflow:
             if delta_t is None:
                 raise ValueError("delta_t is required by this MeanFlow DiT model.")
-            return (x_t, t, delta_t, *condition_inputs)
+            return (x_t, t, delta_t, latent_mask, *condition_inputs)
         if delta_t is not None:
             raise ValueError("delta_t is not supported by this RF DiT model.")
         return (
             x_t,
             t,
+            latent_mask,
             *condition_inputs,
         )
 
@@ -499,6 +552,7 @@ class OpenVINODiTBackend(_OpenVINOBackendBase):
         delta_t: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del context_kv_cache
+        sequence_length = x_t.shape[1]
         inputs = self._prepare_inputs(
             x_t=x_t,
             t=t,
@@ -512,7 +566,10 @@ class OpenVINODiTBackend(_OpenVINOBackendBase):
         )
         compiled_model = self._get_compiled_model(inputs)
         output = compiled_model(inputs)[0]
-        return torch.from_numpy(output.copy()).to(device=x_t.device, dtype=x_t.dtype)
+        return torch.from_numpy(output[:, :sequence_length].copy()).to(
+            device=x_t.device,
+            dtype=x_t.dtype,
+        )
 
 
 class OpenVINOPretrainedTextBackboneBackend(_OpenVINOBackendBase):
