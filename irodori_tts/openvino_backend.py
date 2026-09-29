@@ -529,6 +529,7 @@ class OpenVINOPretrainedTextBackboneBackend(_OpenVINOBackendBase):
                 "OpenVINO pretrained text backbone requires text_encoder_type='pretrained'."
             )
         self.backbone = backbone.eval()
+        self.hidden_size = int(self.backbone.hidden_size)
         self.dtype = next(self.backbone.parameters()).dtype
         super().__init__(device=device, checkpoint_path=checkpoint_path)
 
@@ -589,6 +590,12 @@ class OpenVINOPretrainedTextBackboneBackend(_OpenVINOBackendBase):
             raise ValueError(
                 "Pretrained text backbone input shape mismatch: "
                 f"input_ids={tuple(input_ids.shape)} mask={tuple(mask.shape)}"
+            )
+        if not bool(mask.any()):
+            return torch.zeros(
+                (*input_ids.shape, self.hidden_size),
+                dtype=self.dtype,
+                device=input_ids.device,
             )
         inputs = (input_ids, mask)
         compiled_model = self._get_compiled_model(inputs)

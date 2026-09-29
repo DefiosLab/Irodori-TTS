@@ -40,6 +40,7 @@ from .watermark import SilentCipherWatermarker
 
 PretrainedBackboneFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 CodecDecodeFn = Callable[[torch.Tensor], torch.Tensor]
+_MIN_CONDITION_BUCKET_LENGTH = 8
 
 
 def _is_mps_available() -> bool:
@@ -114,6 +115,30 @@ def list_available_runtime_precisions(device: str | torch.device) -> list[str]:
     if resolved.type in ("cuda", "xpu"):
         return ["fp32", "bf16"]
     return ["fp32"]
+
+
+def _bucket_condition_inputs(
+    input_ids: torch.Tensor,
+    mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if input_ids.ndim != 2 or mask.ndim != 2 or input_ids.shape != mask.shape:
+        raise ValueError(
+            "Condition inputs must have matching (B,S) shapes: "
+            f"input_ids={tuple(input_ids.shape)} mask={tuple(mask.shape)}"
+        )
+    if input_ids.shape[1] == 0:
+        raise ValueError("Condition inputs must contain at least one token position.")
+
+    max_valid_length = int(mask.sum(dim=1).max().item())
+    if max_valid_length == 0:
+        bucket_length = 1
+    else:
+        bucket_length = max(
+            _MIN_CONDITION_BUCKET_LENGTH,
+            1 << (max_valid_length - 1).bit_length(),
+        )
+        bucket_length = min(bucket_length, input_ids.shape[1])
+    return input_ids[:, :bucket_length], mask[:, :bucket_length]
 
 
 def _sync_device(device: torch.device) -> None:
@@ -1300,6 +1325,7 @@ class InferenceRuntime:
                 [normalized_text] * num_candidates,
                 max_length=text_max_len,
             )
+            text_ids, text_mask = _bucket_condition_inputs(text_ids, text_mask)
             stage_sec = _measure_end(self.model_device, t0)
             stage_timings.append(("tokenize_text", stage_sec))
             _log(f"[runtime] tokenize_text: {stage_sec * 1000.0:.1f} ms")
@@ -1319,6 +1345,10 @@ class InferenceRuntime:
                 )
                 if caption_text == "":
                     caption_mask.zero_()
+                caption_ids, caption_mask = _bucket_condition_inputs(
+                    caption_ids,
+                    caption_mask,
+                )
                 caption_ids = caption_ids.to(self.model_device)
                 caption_mask = caption_mask.to(self.model_device)
 
