@@ -654,7 +654,7 @@ def _split_hf_checkpoint_source(source: str) -> tuple[str, str | None]:
     return "/".join(parts[:2]), "/".join(parts[2:])
 
 
-def _download_hf_checkpoint(source: str) -> str:
+def download_hf_checkpoint(source: str) -> str:
     """Download an Irodori checkpoint and any bundled tokenizer assets.
 
     ``source`` accepts either a Hugging Face repo id or ``repo_id/subfolder``.
@@ -1756,7 +1756,7 @@ def acquire_runtime(key: RuntimeKey) -> InferenceRuntime:
         checkpoint_path = str(local_path)
         print(f"[checkpoint] using local file: {checkpoint_path}", flush=True)
     else:
-        checkpoint_path = _download_hf_checkpoint(source)
+        checkpoint_path = download_hf_checkpoint(source)
         print(
             f"[checkpoint] downloaded model.safetensors from hf://{source} -> {checkpoint_path}",
             flush=True,
