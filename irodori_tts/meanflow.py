@@ -507,6 +507,7 @@ def sample_euler_meanflow(
     use_context_kv_cache: bool = True,
     velocity_fn: Callable[..., torch.Tensor] | None = None,
     encoded_conditions: EncodedConditionTensors | None = None,
+    context_kv_cache_fn: Callable[..., list[tuple[torch.Tensor, ...]]] | None = None,
 ) -> torch.Tensor:
     """Linear MeanFlow sampler from Irodori time 1 to 0 (default: 4 NFE)."""
     if str(model.cfg.flow_parameterization).strip().lower() != "meanflow":
@@ -542,7 +543,8 @@ def sample_euler_meanflow(
     encoded = EncodedConditions(*encoded_conditions)
     context_kv_cache = None
     if use_context_kv_cache:
-        context_kv_cache = model.build_context_kv_cache(
+        cache_fn = context_kv_cache_fn or model.build_context_kv_cache
+        context_kv_cache = cache_fn(
             text_state=encoded.text_state,
             speaker_state=encoded.speaker_state,
             caption_state=encoded.caption_state,

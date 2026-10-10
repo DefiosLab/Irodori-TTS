@@ -28,6 +28,7 @@ _CODEC_ENCODER_BUCKETS = (40, 128, 256)
 _CODEC_DECODER_BUCKETS = (40, 80)
 # Per backend; retain both decoder windows and common text/caption profiles.
 _MAX_RESIDENT_NPU_MODELS = 2
+_MAX_CONTEXT_KV_CACHES = 4  # Conditional input plus text/speaker/caption CFG branches.
 
 
 def _condition_profiles_up_to(lengths: tuple[int, int, int]) -> tuple[tuple[int, int, int], ...]:
@@ -268,7 +269,7 @@ def _mask_codec_boundaries(ov: Any, model: Any, frames: int):
 
 
 class _OpenVINOBackendBase(ABC):
-    def __init__(self, *, device: str, checkpoint_path: str | Path) -> None:
+    def __init__(self, *, device: str, checkpoint_path: str | Path, core: Any = None) -> None:
         try:
             import openvino as ov
         except ImportError as exc:
@@ -278,7 +279,7 @@ class _OpenVINOBackendBase(ABC):
 
         self.ov = ov
         self.device = str(device).strip().upper()
-        self.core = ov.Core()
+        self.core = ov.Core() if core is None else core
         if self.device not in self.core.available_devices:
             available = ", ".join(self.core.available_devices) or "none"
             raise RuntimeError(
@@ -552,6 +553,93 @@ class _OpenVINODACVAEBackend(_OpenVINOBackendBase):
         return torch.cat(pieces, dim=-1)
 
 
+def _unpack_context_kv(
+    model: TextToLatentRFDiT, states: tuple[torch.Tensor, ...]
+) -> list[tuple[torch.Tensor, ...]]:
+    cfg = model.cfg
+    states = tuple(
+        state.unflatten(-1, (2 * cfg.num_layers, cfg.num_heads, model.head_dim)) for state in states
+    )
+    return [
+        tuple(state[:, :, 2 * layer + key] for state in states for key in (0, 1))
+        for layer in range(cfg.num_layers)
+    ]
+
+
+class _ContextKVExportWrapper(torch.nn.Module):
+    def __init__(self, model: TextToLatentRFDiT) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(
+        self, text_state: torch.Tensor, speaker_state: torch.Tensor, caption_state: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        cfg = self.model.cfg
+        cache = self.model.build_context_kv_cache(
+            text_state,
+            speaker_state if cfg.use_speaker_condition_resolved else None,
+            caption_state if cfg.use_caption_condition else None,
+        )
+        count = 1 + int(cfg.use_speaker_condition_resolved) + int(cfg.use_caption_condition)
+        return tuple(
+            torch.stack(
+                [layer[2 * condition + key].flatten(2) for layer in cache for key in (0, 1)],
+                dim=2,
+            ).flatten(2)
+            for condition in range(count)
+        )
+
+
+class _OpenVINOContextKVCache(list[tuple[torch.Tensor, ...]]):
+    """Layer views support speaker scaling; packed tensors are bound directly to the DiT."""
+
+    def __init__(
+        self,
+        model: TextToLatentRFDiT,
+        packed: tuple[torch.Tensor, ...],
+        lengths: list[int],
+        profile: tuple[int, int, int],
+        batch_rows: tuple[int, ...],
+    ) -> None:
+        super().__init__(
+            _unpack_context_kv(
+                model,
+                tuple(state[:, :length] for state, length in zip(packed, lengths, strict=True)),
+            )
+        )
+        self.profile = profile
+        active = (True, model.cfg.use_speaker_condition_resolved, model.cfg.use_caption_condition)
+        states = iter(packed)
+        self.packed_states = tuple(
+            next(states) if enabled else packed[0].new_zeros((packed[0].shape[0], 1, 1))
+            for enabled in active
+        )
+        self._batch_rows = batch_rows
+        self._versions = tuple(state._version for state in self.packed_states)
+
+    def batch_rows(self) -> tuple[int, ...]:
+        versions = tuple(state._version for state in self.packed_states)
+        if versions != self._versions:
+            rows = []
+            for index in range(self.packed_states[0].shape[0]):
+                rows.append(
+                    next(
+                        (
+                            previous
+                            for previous in range(index)
+                            if all(
+                                torch.equal(state[previous], state[index])
+                                for state in self.packed_states
+                            )
+                        ),
+                        index,
+                    )
+                )
+            self._batch_rows = tuple(rows)
+            self._versions = versions
+        return self._batch_rows
+
+
 class _RFDiTExportWrapper(torch.nn.Module):
     def __init__(self, model: TextToLatentRFDiT) -> None:
         super().__init__()
@@ -571,6 +659,11 @@ class _RFDiTExportWrapper(torch.nn.Module):
         caption_state: torch.Tensor,
         caption_mask: torch.Tensor,
     ) -> torch.Tensor:
+        states = (text_state,)
+        if self.use_speaker:
+            states += (speaker_state,)
+        if self.use_caption:
+            states += (caption_state,)
         return self.model.forward_with_encoded_conditions(
             x_t=x_t,
             t=t,
@@ -581,7 +674,7 @@ class _RFDiTExportWrapper(torch.nn.Module):
             caption_state=caption_state if self.use_caption else None,
             caption_mask=caption_mask if self.use_caption else None,
             latent_mask=latent_mask,
-            context_kv_cache=None,
+            context_kv_cache=_unpack_context_kv(self.model, states),
         )
 
 
@@ -605,6 +698,11 @@ class _MeanFlowDiTExportWrapper(torch.nn.Module):
         caption_state: torch.Tensor,
         caption_mask: torch.Tensor,
     ) -> torch.Tensor:
+        states = (text_state,)
+        if self.use_speaker:
+            states += (speaker_state,)
+        if self.use_caption:
+            states += (caption_state,)
         return self.model.forward_with_encoded_conditions(
             x_t=x_t,
             t=t,
@@ -616,7 +714,7 @@ class _MeanFlowDiTExportWrapper(torch.nn.Module):
             caption_state=caption_state if self.use_caption else None,
             caption_mask=caption_mask if self.use_caption else None,
             latent_mask=latent_mask,
-            context_kv_cache=None,
+            context_kv_cache=_unpack_context_kv(self.model, states),
         )
 
 
@@ -645,6 +743,201 @@ class _DACVAEDecoderExportWrapper(torch.nn.Module):
         return self.output_layers(x)
 
 
+class _OpenVINOContextKVBackend(_OpenVINOBackendBase):
+    def __init__(
+        self,
+        model: TextToLatentRFDiT,
+        *,
+        device: str,
+        checkpoint_path: str | Path,
+        core: Any,
+    ) -> None:
+        self.model = model
+        self.wrapper = _ContextKVExportWrapper(model).eval()
+        super().__init__(device=device, checkpoint_path=checkpoint_path, core=core)
+        if self.device == "NPU":
+            self._resident_model_limit = 1
+
+    @property
+    def _ir_filename(self) -> str:
+        return "context_kv.xml"
+
+    def _supports_dynamic_ir(self, inputs: tuple[torch.Tensor, ...]) -> bool:
+        return all(tensor.shape[1] <= _MAX_DYNAMIC_SEQUENCE_LENGTH for tensor in inputs)
+
+    def _export_dynamic_ir(self, inputs: tuple[torch.Tensor, ...]):
+        cfg = self.model.cfg
+        batch = torch.export.Dim("batch", min=1)
+        enabled = (True, cfg.use_speaker_condition_resolved, cfg.use_caption_condition)
+        examples = tuple(
+            tensor.new_zeros((2, max(2, tensor.shape[1]) if active else 1, tensor.shape[2]))
+            for tensor, active in zip(inputs, enabled, strict=True)
+        )
+        shapes = tuple(
+            {0: batch, 1: torch.export.Dim(name, min=1, max=_MAX_DYNAMIC_SEQUENCE_LENGTH)}
+            if active
+            else {0: batch}
+            for name, active in zip(("text", "speaker", "caption"), enabled, strict=True)
+        )
+        return self.ov.convert_model(
+            torch.export.export(self.wrapper, examples, dynamic_shapes=shapes)
+        )
+
+    def _convert_static(self, inputs: tuple[torch.Tensor, ...]):
+        return self.ov.convert_model(torch.export.export(self.wrapper, inputs))
+
+    @torch.inference_mode()
+    def prepare_eager_profiles(
+        self,
+        *,
+        max_condition_lengths: tuple[int, int, int],
+        log_fn: Callable[[str], None] | None,
+    ) -> None:
+        cfg = self.model.cfg
+        parameter = next(self.model.parameters())
+        profiles = [
+            (
+                parameter.new_zeros((1, text, cfg.text_dim)),
+                parameter.new_zeros((1, speaker, cfg.speaker_dim))
+                if cfg.use_speaker_condition_resolved
+                else parameter.new_zeros((1, 1, 1)),
+                parameter.new_zeros((1, caption, cfg.caption_dim_resolved))
+                if cfg.use_caption_condition
+                else parameter.new_zeros((1, 1, 1)),
+            )
+            for text, speaker, caption in _condition_profiles_up_to(max_condition_lengths)
+        ]
+        self._prepare_profiles(profiles, log_fn=log_fn)
+
+    @torch.inference_mode()
+    def __call__(
+        self,
+        *,
+        text_state: torch.Tensor,
+        speaker_state: torch.Tensor | None,
+        caption_state: torch.Tensor | None,
+    ) -> list[tuple[torch.Tensor, ...]]:
+        cfg = self.model.cfg
+        states = [text_state]
+        if cfg.use_speaker_condition_resolved:
+            if speaker_state is None:
+                raise ValueError("Speaker state is required by this DiT model.")
+            states.append(speaker_state)
+        if cfg.use_caption_condition:
+            if caption_state is None:
+                raise ValueError("Caption state is required by this DiT model.")
+            states.append(caption_state)
+        lengths = [state.shape[1] for state in states]
+        profile = _select_condition_profile(
+            text_state.shape[1],
+            speaker_state.shape[1] if cfg.use_speaker_condition_resolved else 0,
+            caption_state.shape[1] if cfg.use_caption_condition else 0,
+        )
+        batch = text_state.shape[0]
+        inputs = tuple(
+            _pad_condition_sequence(
+                state, torch.ones(state.shape[:2], dtype=torch.bool, device=state.device), length
+            )[0]
+            if active
+            else text_state.new_zeros((batch, 1, 1))
+            for state, length, active in zip(
+                (text_state, speaker_state, caption_state),
+                profile,
+                (True, cfg.use_speaker_condition_resolved, cfg.use_caption_condition),
+                strict=True,
+            )
+        )
+        rows = []
+        unique = []
+        batch_rows = []
+        for index, batch_inputs in enumerate(_iter_batch_inputs(inputs)):
+            entry = next(
+                (
+                    (output, row)
+                    for previous, output, row in unique
+                    if all(
+                        torch.equal(left, right)
+                        for left, right in zip(previous, batch_inputs, strict=True)
+                    )
+                ),
+                None,
+            )
+            if entry is None:
+                compiled = self._get_compiled_model(batch_inputs)
+                output = compiled(batch_inputs)
+                # Normal tensors track mutations made by force-speaker K/V scaling.
+                with torch.inference_mode(False):
+                    projected = tuple(
+                        torch.from_numpy(output[index].copy()) for index in range(len(states))
+                    )
+                unique.append((batch_inputs, projected, index))
+                batch_rows.append(index)
+            else:
+                projected, row = entry
+                batch_rows.append(row)
+            rows.append(projected)
+        with torch.inference_mode(False):
+            packed = tuple(
+                torch.cat([row[index] for row in rows], dim=0) for index in range(len(states))
+            )
+            return _OpenVINOContextKVCache(self.model, packed, lengths, profile, tuple(batch_rows))
+
+
+class _CachedDiTCompiledModel:
+    def __init__(self, compiled_model: Any, *, state_indexes: tuple[int, ...]) -> None:
+        self.compiled_model = compiled_model
+        self.state_indexes = state_indexes
+        self._requests: OrderedDict[tuple, tuple[Any, tuple[torch.Tensor, ...]]] = OrderedDict()
+
+    def get_property(self, name: str):
+        return self.compiled_model.get_property(name)
+
+    @staticmethod
+    def _state_key(states: tuple[torch.Tensor, ...]) -> tuple:
+        return tuple(
+            (
+                tensor.data_ptr(),
+                tuple(tensor.shape),
+                None if tensor.is_inference() else tensor._version,
+            )
+            for tensor in states
+        )
+
+    def __call__(self, inputs: tuple[torch.Tensor, ...]):
+        states = tuple(inputs[index] for index in self.state_indexes)
+        key = self._state_key(states)
+        entry = self._requests.pop(key, None)
+        if entry is None:
+            previous_key = next(
+                (
+                    previous_key
+                    for previous_key, (_, previous) in self._requests.items()
+                    if self._state_key(previous) == previous_key
+                    and all(
+                        torch.equal(left, right)
+                        for left, right in zip(previous, states, strict=True)
+                    )
+                ),
+                None,
+            )
+            if previous_key is not None:
+                entry = self._requests.pop(previous_key)
+        if entry is None:
+            if len(self._requests) >= _MAX_CONTEXT_KV_CACHES:
+                self._requests.popitem(last=False)
+            request = self.compiled_model.create_infer_request()
+            # Keep K/V in the request's native device buffers across diffusion steps.
+            for index in self.state_indexes:
+                request.get_input_tensor(index).data[...] = inputs[index].numpy()
+        else:
+            request = entry[0]
+        self._requests[key] = (request, states)
+        for index, tensor in enumerate(inputs):
+            if index not in self.state_indexes:
+                request.get_input_tensor(index).data[...] = tensor.numpy()
+        return request.infer(share_outputs=True)
+
+
 class OpenVINODiTBackend(_OpenVINOBackendBase):
     def __init__(
         self,
@@ -656,10 +949,115 @@ class OpenVINODiTBackend(_OpenVINOBackendBase):
         self.model = model.eval()
         self.is_meanflow = self.model.cfg.flow_parameterization == "meanflow"
         super().__init__(device=device, checkpoint_path=checkpoint_path)
+        self._context_kv_backend = _OpenVINOContextKVBackend(
+            self.model, device=device, checkpoint_path=checkpoint_path, core=self.core
+        )
+        self._packed_context_caches: OrderedDict[int, tuple] = OrderedDict()
 
     @property
     def _ir_filename(self) -> str:
-        return "meanflow_dit.xml" if self.is_meanflow else "rf_dit.xml"
+        return "meanflow_dit_kv.xml" if self.is_meanflow else "rf_dit_kv.xml"
+
+    def _compile(self, inputs: tuple[torch.Tensor, ...]):
+        offset = 4 if self.is_meanflow else 3
+        active = (
+            True,
+            self.model.cfg.use_speaker_condition_resolved,
+            self.model.cfg.use_caption_condition,
+        )
+        return _CachedDiTCompiledModel(
+            super()._compile(inputs),
+            state_indexes=tuple(
+                offset + 2 * index for index, enabled in enumerate(active) if enabled
+            ),
+        )
+
+    def _warmup(
+        self, compiled_model: _CachedDiTCompiledModel, inputs: tuple[torch.Tensor, ...]
+    ) -> None:
+        compiled_model(inputs)
+        compiled_model._requests.clear()
+
+    def build_context_kv_cache(
+        self,
+        *,
+        text_state: torch.Tensor,
+        speaker_state: torch.Tensor | None,
+        caption_state: torch.Tensor | None = None,
+    ) -> list[tuple[torch.Tensor, ...]]:
+        return self._context_kv_backend(
+            text_state=text_state, speaker_state=speaker_state, caption_state=caption_state
+        )
+
+    def _run_batched(
+        self,
+        inputs: tuple[torch.Tensor, ...],
+        *,
+        context_rows: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        outputs = []
+        state_indexes = (4, 6, 8) if self.is_meanflow else (3, 5, 7)
+        for index, batch_inputs in enumerate(_iter_batch_inputs(inputs)):
+            if context_rows is not None:
+                # Identical candidates share the same K/V binding, including CFG branches.
+                row = context_rows[index]
+                batch_inputs = tuple(
+                    inputs[position][row : row + 1].contiguous()
+                    if position in state_indexes
+                    else tensor
+                    for position, tensor in enumerate(batch_inputs)
+                )
+            compiled_model = self._get_compiled_model(batch_inputs)
+            outputs.append(torch.from_numpy(compiled_model(batch_inputs)[0].copy()))
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
+
+    def _pack_context_cache(
+        self,
+        cache: list[tuple[torch.Tensor, ...]],
+        profile: tuple[int, int, int],
+    ) -> tuple[torch.Tensor, ...]:
+        if isinstance(cache, _OpenVINOContextKVCache) and cache.profile == profile:
+            return cache.packed_states
+        # Force-speaker scaling mutates K/V in place; invalidate packed inputs on mutation.
+        try:
+            versions = tuple(tensor._version for layer in cache for tensor in layer)
+        except RuntimeError:
+            # External inference tensors lack version counters and cannot be memoized safely.
+            versions = None
+        entry = self._packed_context_caches.get(id(cache)) if versions is not None else None
+        if entry is not None and entry[1:3] == (profile, versions):
+            self._packed_context_caches.move_to_end(id(cache))
+            return entry[3]
+        cfg = self.model.cfg
+        if len(cache) != cfg.num_layers:
+            raise ValueError("Context K/V cache must contain one entry per DiT layer.")
+        packed = []
+        offset = 0
+        for length, active in zip(
+            profile,
+            (True, cfg.use_speaker_condition_resolved, cfg.use_caption_condition),
+            strict=True,
+        ):
+            if active:
+                state = torch.stack(
+                    [layer[offset + key].flatten(2) for layer in cache for key in (0, 1)], dim=2
+                ).flatten(2)
+                state = _pad_condition_sequence(
+                    state,
+                    torch.ones(state.shape[:2], dtype=torch.bool, device=state.device),
+                    length,
+                )[0]
+                offset += 2
+            else:
+                state = cache[0][0].new_zeros((cache[0][0].shape[0], 1, 1))
+            packed.append(state)
+        packed = tuple(packed)
+        if versions is not None:
+            self._packed_context_caches[id(cache)] = (cache, profile, versions, packed)
+            self._packed_context_caches.move_to_end(id(cache))
+            if len(self._packed_context_caches) > _MAX_CONTEXT_KV_CACHES:
+                self._packed_context_caches.popitem(last=False)
+        return packed
 
     def _supports_dynamic_ir(self, inputs: tuple[torch.Tensor, ...]) -> bool:
         sequence_indexes = (0, 4, 6, 8) if self.is_meanflow else (0, 3, 5, 7)
@@ -843,6 +1241,10 @@ class OpenVINODiTBackend(_OpenVINOBackendBase):
     ) -> None:
         cfg = self.model.cfg
         parameter = next(self.model.parameters())
+        self._context_kv_backend.prepare_eager_profiles(
+            max_condition_lengths=max_condition_lengths, log_fn=log_fn
+        )
+        packed_dim = 2 * cfg.num_layers * cfg.model_dim
 
         def condition(length: int, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
             state = parameter.new_zeros((1, length, dim))
@@ -854,16 +1256,14 @@ class OpenVINODiTBackend(_OpenVINOBackendBase):
         for text_length, speaker_length, caption_length in _condition_profiles_up_to(
             max_condition_lengths
         ):
-            text_state, text_mask = condition(text_length, cfg.text_dim)
+            text_state, text_mask = condition(text_length, packed_dim)
             speaker_state, speaker_mask = (
-                condition(speaker_length, cfg.speaker_dim)
+                condition(speaker_length, packed_dim)
                 if cfg.use_speaker_condition_resolved
                 else (None, None)
             )
             caption_state, caption_mask = (
-                condition(caption_length, cfg.caption_dim_resolved)
-                if cfg.use_caption_condition
-                else (None, None)
+                condition(caption_length, packed_dim) if cfg.use_caption_condition else (None, None)
             )
             for length in latent_buckets:
                 profiles.append(
@@ -895,20 +1295,57 @@ class OpenVINODiTBackend(_OpenVINOBackendBase):
         context_kv_cache: list[tuple[torch.Tensor, ...]] | None = None,
         delta_t: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        del context_kv_cache
+        cfg = self.model.cfg
+        for state, mask, enabled in zip(
+            (text_state, speaker_state, caption_state),
+            (text_mask, speaker_mask, caption_mask),
+            (True, cfg.use_speaker_condition_resolved, cfg.use_caption_condition),
+            strict=True,
+        ):
+            if enabled:
+                if state is None or mask is None:
+                    raise ValueError(
+                        "Enabled condition states and masks are required by this DiT model."
+                    )
+                _pad_condition_sequence(state, mask, state.shape[1])
+        profile = _select_condition_profile(
+            text_state.shape[1],
+            speaker_state.shape[1]
+            if cfg.use_speaker_condition_resolved and speaker_state is not None
+            else 0,
+            caption_state.shape[1]
+            if cfg.use_caption_condition and caption_state is not None
+            else 0,
+        )
+        if context_kv_cache is None:
+            context_kv_cache = self.build_context_kv_cache(
+                text_state=text_state, speaker_state=speaker_state, caption_state=caption_state
+            )
+        states = self._pack_context_cache(context_kv_cache, profile)
+        masks = tuple(
+            torch.nn.functional.pad(mask, (0, state.shape[1] - mask.shape[1]))
+            if mask is not None
+            else None
+            for state, mask in zip(states, (text_mask, speaker_mask, caption_mask), strict=True)
+        )
         sequence_length = x_t.shape[1]
         inputs = self._prepare_inputs(
             x_t=x_t,
             t=t,
             delta_t=delta_t,
-            text_state=text_state,
-            text_mask=text_mask,
-            speaker_state=speaker_state,
-            speaker_mask=speaker_mask,
-            caption_state=caption_state,
-            caption_mask=caption_mask,
+            text_state=states[0],
+            text_mask=masks[0],
+            speaker_state=states[1],
+            speaker_mask=masks[1],
+            caption_state=states[2],
+            caption_mask=masks[2],
         )
-        output = self._run_batched(inputs)
+        context_rows = (
+            context_kv_cache.batch_rows()
+            if isinstance(context_kv_cache, _OpenVINOContextKVCache)
+            else None
+        )
+        output = self._run_batched(inputs, context_rows=context_rows)
         return output[:, :sequence_length].to(
             device=x_t.device,
             dtype=x_t.dtype,
@@ -1177,7 +1614,7 @@ def create_dit_backend(
     *,
     device: str,
     checkpoint_path: str | Path,
-) -> Callable[..., torch.Tensor]:
+) -> OpenVINODiTBackend:
     return OpenVINODiTBackend(
         model,
         device=device,

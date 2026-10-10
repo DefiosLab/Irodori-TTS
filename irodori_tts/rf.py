@@ -148,6 +148,7 @@ def sample_euler_rf_cfg(
     sway_coeff: float = -1.0,
     velocity_fn: RFVelocityFn | None = None,
     encoded_conditions: EncodedConditionTensors | None = None,
+    context_kv_cache_fn: Callable[..., list[tuple[torch.Tensor, ...]]] | None = None,
 ) -> torch.Tensor:
     """
     Euler sampling over RF ODE with text/reference/caption conditioning CFG.
@@ -419,20 +420,21 @@ def sample_euler_rf_cfg(
     context_kv_joint_uncond = None
     context_kv_alternating: dict[str, list[tuple[torch.Tensor, ...]]] = {}
     if effective_use_context_kv_cache:
-        context_kv_cond = model.build_context_kv_cache(
+        cache_fn = context_kv_cache_fn or model.build_context_kv_cache
+        context_kv_cond = cache_fn(
             text_state=text_state_cond,
             speaker_state=speaker_state_cond,
             caption_state=caption_state_cond,
         )
         if use_independent_cfg and cfg_batch_mult > 1:
-            context_kv_cfg = model.build_context_kv_cache(
+            context_kv_cfg = cache_fn(
                 text_state=independent_text_state,
                 speaker_state=independent_speaker_state,
                 caption_state=independent_caption_state,
             )
         elif use_joint_cfg:
             if enabled_cfg_names:
-                context_kv_joint_uncond = model.build_context_kv_cache(
+                context_kv_joint_uncond = cache_fn(
                     text_state=joint_uncond_bundle[0],
                     speaker_state=joint_uncond_bundle[2],
                     caption_state=joint_uncond_bundle[4],
@@ -440,7 +442,7 @@ def sample_euler_rf_cfg(
         elif use_alternating_cfg:
             for name in enabled_cfg_names:
                 bundle = alternating_bundles[name]
-                context_kv_alternating[name] = model.build_context_kv_cache(
+                context_kv_alternating[name] = cache_fn(
                     text_state=bundle[0],
                     speaker_state=bundle[2],
                     caption_state=bundle[4],

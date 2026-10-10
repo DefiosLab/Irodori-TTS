@@ -11,7 +11,7 @@ from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torchaudio
@@ -37,6 +37,9 @@ from .speaker_inversion import (
 from .text_normalization import normalize_text
 from .tokenizer import PretrainedTextTokenizer
 from .watermark import SilentCipherWatermarker
+
+if TYPE_CHECKING:
+    from .openvino_backend import OpenVINODiTBackend
 
 PretrainedBackboneFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 CodecEncodeFn = Callable[[torch.Tensor], torch.Tensor]
@@ -244,7 +247,7 @@ def _create_dit_forward_fn(
     model: TextToLatentRFDiT,
     model_device: str | torch.device,
     checkpoint_path: str | Path,
-) -> Callable[..., torch.Tensor] | None:
+) -> OpenVINODiTBackend | None:
     if not _is_npu_device(model_device):
         return None
     from .openvino_backend import create_dit_backend
@@ -712,6 +715,7 @@ class InferenceRuntime:
         default_caption_max_len: int,
         default_max_ref_seconds: float = _LEGACY_MAX_REF_SECONDS,
         dit_forward_fn: Callable[..., torch.Tensor] | None = None,
+        context_kv_cache_fn: Callable[..., list[tuple[torch.Tensor, ...]]] | None = None,
         pretrained_backbone_fn: PretrainedBackboneFn | None = None,
         codec_encode_fn: CodecEncodeFn | None = None,
         codec_decode_fn: CodecDecodeFn | None = None,
@@ -729,6 +733,7 @@ class InferenceRuntime:
         self.train_cfg = train_cfg
         self.model = model
         self.dit_forward_fn = dit_forward_fn
+        self.context_kv_cache_fn = context_kv_cache_fn
         self.pretrained_backbone_fn = pretrained_backbone_fn
         self.codec_encode_fn = codec_encode_fn
         self.codec_decode_fn = codec_decode_fn
@@ -786,7 +791,7 @@ class InferenceRuntime:
             enabled=bool(key.compile_model),
             dynamic=bool(key.compile_dynamic),
         )
-        dit_forward_fn = _create_dit_forward_fn(
+        dit_backend = _create_dit_forward_fn(
             model=model,
             model_device=key.model_device,
             checkpoint_path=checkpoint_path,
@@ -881,7 +886,10 @@ class InferenceRuntime:
             default_text_max_len=default_text_max_len,
             default_caption_max_len=default_caption_max_len,
             default_max_ref_seconds=default_max_ref_seconds,
-            dit_forward_fn=dit_forward_fn,
+            dit_forward_fn=dit_backend,
+            context_kv_cache_fn=(
+                dit_backend.build_context_kv_cache if dit_backend is not None else None
+            ),
             pretrained_backbone_fn=pretrained_backbone_fn,
             codec_encode_fn=codec_encode_fn,
             codec_decode_fn=codec_decode_fn,
@@ -1595,6 +1603,7 @@ class InferenceRuntime:
                     use_context_kv_cache=bool(req.context_kv_cache),
                     velocity_fn=self.dit_forward_fn,
                     encoded_conditions=encoded_conditions,
+                    context_kv_cache_fn=self.context_kv_cache_fn,
                 )
             else:
                 z_patched = sample_euler_rf_cfg(
@@ -1628,6 +1637,7 @@ class InferenceRuntime:
                     sway_coeff=float(req.sway_coeff),
                     velocity_fn=self.dit_forward_fn,
                     encoded_conditions=encoded_conditions,
+                    context_kv_cache_fn=self.context_kv_cache_fn,
                 )
             stage_sec = _measure_end(self.model_device, t0)
             sample_stage = (
@@ -1724,6 +1734,7 @@ class InferenceRuntime:
 
     def unload(self) -> None:
         self.dit_forward_fn = None
+        self.context_kv_cache_fn = None
         self.pretrained_backbone_fn = None
         self.codec_encode_fn = None
         self.codec_decode_fn = None
