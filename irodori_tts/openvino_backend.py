@@ -14,6 +14,12 @@ from .model import TextToLatentRFDiT, precompute_freqs_cis
 
 _IR_CACHE_VERSION = 1
 _MAX_DYNAMIC_SEQUENCE_LENGTH = 4096
+_CONDITION_SEQUENCE_PROFILES = (
+    # Text, speaker (after reference encoding), caption.
+    (32, 64, 32),
+    (128, 256, 128),
+    (512, 1024, 512),
+)
 _LATENT_SEQUENCE_BUCKETS = (
     8,
     12,
@@ -35,6 +41,46 @@ _LATENT_SEQUENCE_BUCKETS = (
     3072,
     4096,
 )
+
+
+def _select_condition_profile(
+    text_length: int,
+    speaker_length: int,
+    caption_length: int,
+) -> tuple[int, int, int]:
+    lengths = (text_length, speaker_length, caption_length)
+    for profile in _CONDITION_SEQUENCE_PROFILES:
+        if all(length <= capacity for length, capacity in zip(lengths, profile, strict=True)):
+            return profile
+
+    # Keep oversized inputs intact without introducing independent condition buckets.
+    largest = _CONDITION_SEQUENCE_PROFILES[-1]
+    scale = max(
+        (length + capacity - 1) // capacity
+        for length, capacity in zip(lengths, largest, strict=True)
+    )
+    scale = 1 << (scale - 1).bit_length()
+    return tuple(capacity * scale for capacity in largest)
+
+
+def _pad_condition_sequence(
+    state: torch.Tensor,
+    mask: torch.Tensor,
+    length: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if state.ndim not in (2, 3) or mask.ndim != 2 or state.shape[:2] != mask.shape:
+        raise ValueError(
+            "Condition state and mask must have matching (B,S) dimensions: "
+            f"state={tuple(state.shape)} mask={tuple(mask.shape)}"
+        )
+    padding_length = length - state.shape[1]
+    if padding_length < 0:
+        raise ValueError(f"Condition length {state.shape[1]} exceeds profile capacity {length}.")
+    if padding_length == 0:
+        return state, mask
+    padding = state.new_zeros((state.shape[0], padding_length, *state.shape[2:]))
+    mask_padding = mask.new_zeros((mask.shape[0], padding_length))
+    return torch.cat((state, padding), dim=1), torch.cat((mask, mask_padding), dim=1)
 
 
 def _bucket_latent_input(x_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -515,6 +561,20 @@ class OpenVINODiTBackend(_OpenVINOBackendBase):
         else:
             caption_state = torch.empty((batch, 1, 1), dtype=x_t.dtype, device=x_t.device)
             caption_mask = torch.zeros((batch, 1), dtype=torch.bool, device=x_t.device)
+        profile = _select_condition_profile(
+            text_state.shape[1],
+            speaker_state.shape[1] if self.model.cfg.use_speaker_condition_resolved else 0,
+            caption_state.shape[1] if self.model.cfg.use_caption_condition else 0,
+        )
+        text_state, text_mask = _pad_condition_sequence(text_state, text_mask, profile[0])
+        if self.model.cfg.use_speaker_condition_resolved:
+            speaker_state, speaker_mask = _pad_condition_sequence(
+                speaker_state, speaker_mask, profile[1]
+            )
+        if self.model.cfg.use_caption_condition:
+            caption_state, caption_mask = _pad_condition_sequence(
+                caption_state, caption_mask, profile[2]
+            )
         condition_inputs = (
             text_state,
             text_mask,
@@ -664,10 +724,14 @@ class OpenVINOPretrainedTextBackboneBackend(_OpenVINOBackendBase):
                 dtype=self.dtype,
                 device=input_ids.device,
             )
-        inputs = (input_ids, mask)
+        sequence_length = input_ids.shape[1]
+        bucket_length = _select_condition_profile(sequence_length, 0, 0)[0]
+        inputs = _pad_condition_sequence(input_ids, mask, bucket_length)
         compiled_model = self._get_compiled_model(inputs)
         output = compiled_model(inputs)[0]
-        return torch.from_numpy(output.copy()).to(device=input_ids.device, dtype=self.dtype)
+        return torch.from_numpy(output[:, :sequence_length].copy()).to(
+            device=input_ids.device, dtype=self.dtype
+        )
 
 
 class OpenVINODACVAEEncoderBackend(_OpenVINOBackendBase):
