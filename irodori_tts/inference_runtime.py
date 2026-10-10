@@ -7,6 +7,7 @@ import math
 import secrets
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
@@ -45,6 +46,8 @@ PretrainedBackboneFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 CodecEncodeFn = Callable[[torch.Tensor], torch.Tensor]
 CodecDecodeFn = Callable[[torch.Tensor], torch.Tensor]
 _MIN_CONDITION_BUCKET_LENGTH = 8
+_MAX_CACHED_REFERENCE_LATENTS = 16
+_MAX_REFERENCE_LATENT_CACHE_BYTES = 32 * 1024 * 1024
 
 
 def _is_mps_available() -> bool:
@@ -747,6 +750,9 @@ class InferenceRuntime:
         self._infer_lock = threading.Lock()
         self._model_dtype = next(self.model.parameters()).dtype
         self._lora_adapter_names: dict[str, str] = {}
+        self._reference_latent_cache: OrderedDict[tuple, tuple[torch.Tensor, tuple[str, ...]]] = (
+            OrderedDict()
+        )
 
     @classmethod
     def from_key(cls, key: RuntimeKey) -> InferenceRuntime:
@@ -1040,6 +1046,77 @@ class InferenceRuntime:
         self.model.eval()
         return nullcontext()
 
+    def _encode_reference_waveform(
+        self,
+        *,
+        path: str,
+        req: SamplingRequest,
+        max_ref_seconds: float | None,
+        messages: list[str],
+    ) -> torch.Tensor:
+        cache_key = None
+        if self.codec.deterministic_encode:
+            source = Path(path).resolve()
+            stat = source.stat()
+            cache_key = (
+                source,
+                stat.st_dev,
+                stat.st_ino,
+                stat.st_size,
+                stat.st_mtime_ns,
+                stat.st_ctime_ns,
+                max_ref_seconds,
+                req.ref_normalize_db,
+                bool(req.ref_ensure_max),
+            )
+            cached = self._reference_latent_cache.get(cache_key)
+            if cached is not None:
+                self._reference_latent_cache.move_to_end(cache_key)
+                latent, cached_messages = cached
+                messages.extend(cached_messages)
+                return latent
+
+        clip_messages = []
+        wav, sr = _load_audio(path)
+        if max_ref_seconds is not None:
+            max_ref_samples = max(1, int(max_ref_seconds * float(sr)))
+            if wav.shape[1] > max_ref_samples:
+                clip_messages.append(
+                    f"warning: reference audio exceeds max_ref_seconds ({max_ref_seconds}s). "
+                    f"Trimming from {float(wav.shape[1]) / float(sr):.2f}s to {float(max_ref_samples) / float(sr):.2f}s."
+                )
+                wav = wav[:, :max_ref_samples]
+        latent = (
+            self.codec.encode_waveform(
+                wav.unsqueeze(0),
+                sample_rate=int(sr),
+                normalize_db=req.ref_normalize_db,
+                ensure_max=bool(req.ref_ensure_max),
+                encode_fn=self.codec_encode_fn,
+            )
+            .detach()
+            .cpu()
+        )
+        if latent.shape[1] == 0:
+            raise ValueError(f"Reference waveform produced an empty latent: {path}")
+        messages.extend(clip_messages)
+
+        if (
+            cache_key is not None
+            and latent.numel() * latent.element_size() <= _MAX_REFERENCE_LATENT_CACHE_BYTES
+        ):
+            self._reference_latent_cache[cache_key] = (latent, tuple(clip_messages))
+            while (
+                len(self._reference_latent_cache) > _MAX_CACHED_REFERENCE_LATENTS
+                or sum(
+                    value.numel() * value.element_size()
+                    for value, _ in self._reference_latent_cache.values()
+                )
+                > _MAX_REFERENCE_LATENT_CACHE_BYTES
+            ):
+                self._reference_latent_cache.popitem(last=False)
+        return latent
+
     def _load_reference_latent(
         self,
         *,
@@ -1135,24 +1212,14 @@ class InferenceRuntime:
                 )
             latent_pieces = []
             for path in wav_paths:
-                wav, sr = _load_audio(path)
-                if len(wav_paths) == 1 and max_ref_seconds > 0:
-                    max_ref_samples = max(1, int(max_ref_seconds * float(sr)))
-                    if wav.shape[1] > max_ref_samples:
-                        messages.append(
-                            f"warning: reference audio exceeds max_ref_seconds ({max_ref_seconds}s). "
-                            f"Trimming from {float(wav.shape[1]) / float(sr):.2f}s to {float(max_ref_samples) / float(sr):.2f}s."
-                        )
-                        wav = wav[:, :max_ref_samples]
-                piece = self.codec.encode_waveform(
-                    wav.unsqueeze(0),
-                    sample_rate=int(sr),
-                    normalize_db=req.ref_normalize_db,
-                    ensure_max=bool(req.ref_ensure_max),
-                    encode_fn=self.codec_encode_fn,
-                ).cpu()
-                if piece.shape[1] == 0:
-                    raise ValueError(f"Reference waveform produced an empty latent: {path}")
+                piece = self._encode_reference_waveform(
+                    path=path,
+                    req=req,
+                    max_ref_seconds=max_ref_seconds
+                    if len(wav_paths) == 1 and max_ref_seconds > 0
+                    else None,
+                    messages=messages,
+                )
                 latent_pieces.append(piece)
                 if (
                     max_ref_latent_steps is not None
@@ -1733,6 +1800,7 @@ class InferenceRuntime:
         )
 
     def unload(self) -> None:
+        self._reference_latent_cache.clear()
         self.dit_forward_fn = None
         self.context_kv_cache_fn = None
         self.pretrained_backbone_fn = None
