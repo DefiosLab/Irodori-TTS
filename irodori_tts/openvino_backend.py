@@ -5,6 +5,7 @@ import os
 import time
 import warnings
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,8 @@ _CONDITION_SEQUENCE_PROFILES = (
 _LATENT_SEQUENCE_BUCKETS = (48, 128, 256, 512, 768)
 _CODEC_ENCODER_BUCKETS = (40, 128, 256)
 _CODEC_DECODER_BUCKETS = (40, 80)
+# Per backend; retain both decoder windows and common text/caption profiles.
+_MAX_RESIDENT_NPU_MODELS = 2
 
 
 def _condition_profiles_up_to(lengths: tuple[int, int, int]) -> tuple[tuple[int, int, int], ...]:
@@ -284,9 +287,10 @@ class _OpenVINOBackendBase(ABC):
         self._ir_dir: Path | None = None
         self._ir_model = None
         self._dynamic_ir_unavailable = False
-        self._compiled_models: dict[
+        self._compiled_models: OrderedDict[
             tuple[tuple[tuple[int, ...], torch.dtype], ...], Any
-        ] = {}
+        ] = OrderedDict()
+        self._resident_model_limit = _MAX_RESIDENT_NPU_MODELS if self.device == "NPU" else None
         self._warmed_profiles: set[tuple[tuple[tuple[int, ...], torch.dtype], ...]] = set()
         self._initialize_cache(Path(checkpoint_path))
 
@@ -424,8 +428,16 @@ class _OpenVINOBackendBase(ABC):
         signature = tuple((tuple(tensor.shape), tensor.dtype) for tensor in inputs)
         compiled_model = self._compiled_models.get(signature)
         if compiled_model is None:
+            if (
+                self._resident_model_limit is not None
+                and len(self._compiled_models) >= self._resident_model_limit
+            ):
+                # Release the device allocation before loading the next cached profile.
+                self._compiled_models.popitem(last=False)
             compiled_model = self._compile(inputs)
             self._compiled_models[signature] = compiled_model
+        else:
+            self._compiled_models.move_to_end(signature)
         return compiled_model
 
     def _run_batched(self, inputs: tuple[torch.Tensor, ...]) -> torch.Tensor:
@@ -465,6 +477,7 @@ class _OpenVINOBackendBase(ABC):
                 f"{prefix} ready: cache={compiled_model.get_property('LOADED_FROM_CACHE')}, "
                 f"load/compile={compile_seconds:.2f}s, warmup={time.perf_counter() - started:.2f}s"
             )
+            del compiled_model
 
 
 class _OpenVINODACVAEBackend(_OpenVINOBackendBase):
