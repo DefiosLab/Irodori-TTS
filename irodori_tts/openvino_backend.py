@@ -75,11 +75,11 @@ def _replace_squared_sine_with_polynomial(ov: Any, model: Any) -> None:
     for sin_node in sin_nodes:
         consumers = list(sin_node.output(0).get_target_inputs())
         if len(consumers) != 1 or consumers[0].get_node().get_type_name() != "Power":
-            raise RuntimeError("DACVAE decoder Sin must be consumed by a single Power operation.")
+            raise RuntimeError("DACVAE Sin must be consumed by a single Power operation.")
         power_node = consumers[0].get_node()
         exponent = power_node.input_value(1).get_node()
         if exponent.get_type_name() != "Constant" or exponent.get_vector() != [2.0]:
-            raise RuntimeError("DACVAE decoder Sin must be squared by a constant exponent of 2.")
+            raise RuntimeError("DACVAE Sin must be squared by a constant exponent of 2.")
 
         value = sin_node.input_value(0)
         element_type = value.get_element_type()
@@ -346,6 +346,16 @@ class _MeanFlowDiTExportWrapper(torch.nn.Module):
             latent_mask=latent_mask,
             context_kv_cache=None,
         )
+
+
+class _DACVAEEncoderExportWrapper(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module) -> None:
+        super().__init__()
+        self.encoder = model.encoder
+        self.in_proj = model.quantizer.in_proj
+
+    def forward(self, waveform: torch.Tensor) -> torch.Tensor:
+        return self.in_proj(self.encoder(waveform))
 
 
 class _DACVAEDecoderExportWrapper(torch.nn.Module):
@@ -660,6 +670,71 @@ class OpenVINOPretrainedTextBackboneBackend(_OpenVINOBackendBase):
         return torch.from_numpy(output.copy()).to(device=input_ids.device, dtype=self.dtype)
 
 
+class OpenVINODACVAEEncoderBackend(_OpenVINOBackendBase):
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        *,
+        device: str,
+        checkpoint_path: str | Path,
+        deterministic_encode: bool,
+    ) -> None:
+        self.model = model.eval()
+        self.wrapper = _DACVAEEncoderExportWrapper(self.model).eval()
+        self.dtype = next(self.model.parameters()).dtype
+        self.hop_length = int(self.model.hop_length)
+        self.deterministic_encode = deterministic_encode
+        super().__init__(device=device, checkpoint_path=checkpoint_path)
+
+    @property
+    def _ir_filename(self) -> str:
+        return "dacvae_encoder_poly.xml"
+
+    def _convert_exported(self, exported: torch.export.ExportedProgram):
+        model = self.ov.convert_model(exported)
+        _replace_squared_sine_with_polynomial(self.ov, model)
+        return model
+
+    def _supports_dynamic_ir(self, inputs: tuple[torch.Tensor, ...]) -> bool:
+        return inputs[0].shape[2] // self.hop_length <= _MAX_DYNAMIC_SEQUENCE_LENGTH
+
+    def _export_dynamic_ir(self, inputs: tuple[torch.Tensor, ...]):
+        waveform = inputs[0]
+        export_input = torch.zeros(
+            (2, 1, self.hop_length * max(2, waveform.shape[2] // self.hop_length)),
+            dtype=waveform.dtype,
+            device=waveform.device,
+        )
+        batch = torch.export.Dim("batch", min=1)
+        latent = torch.export.Dim("latent", min=1, max=_MAX_DYNAMIC_SEQUENCE_LENGTH)
+        with torch.inference_mode():
+            exported = torch.export.export(
+                self.wrapper,
+                (export_input,),
+                dynamic_shapes=({0: batch, 2: self.hop_length * latent},),
+            )
+        return self._convert_exported(exported)
+
+    def _convert_static(self, inputs: tuple[torch.Tensor, ...]):
+        with torch.inference_mode():
+            exported = torch.export.export(self.wrapper, inputs)
+        return self._convert_exported(exported)
+
+    def __call__(self, waveform: torch.Tensor) -> torch.Tensor:
+        if waveform.ndim != 3 or waveform.shape[1] != 1:
+            raise ValueError(f"Expected mono waveform shape (B,1,T), got {tuple(waveform.shape)}")
+        waveform = waveform.contiguous().to(device="cpu", dtype=self.dtype)
+        waveform = self.model._pad(waveform)
+        compiled_model = self._get_compiled_model((waveform,))
+        output = compiled_model((waveform,))[0]
+        mean, scale = torch.from_numpy(output.copy()).chunk(2, dim=1)
+        if self.deterministic_encode:
+            encoded = mean
+        else:
+            encoded, _ = self.model.quantizer._vae_sample(mean, scale)
+        return encoded.transpose(1, 2).contiguous()
+
+
 class OpenVINODACVAEDecoderBackend(_OpenVINOBackendBase):
     def __init__(
         self,
@@ -743,6 +818,21 @@ def create_pretrained_text_backbone_backend(
         model,
         device=device,
         checkpoint_path=checkpoint_path,
+    )
+
+
+def create_dacvae_encoder_backend(
+    model: torch.nn.Module,
+    *,
+    device: str,
+    checkpoint_path: str | Path,
+    deterministic_encode: bool,
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    return OpenVINODACVAEEncoderBackend(
+        model,
+        device=device,
+        checkpoint_path=checkpoint_path,
+        deterministic_encode=deterministic_encode,
     )
 
 

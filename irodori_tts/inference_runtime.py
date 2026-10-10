@@ -39,6 +39,7 @@ from .tokenizer import PretrainedTextTokenizer
 from .watermark import SilentCipherWatermarker
 
 PretrainedBackboneFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+CodecEncodeFn = Callable[[torch.Tensor], torch.Tensor]
 CodecDecodeFn = Callable[[torch.Tensor], torch.Tensor]
 _MIN_CONDITION_BUCKET_LENGTH = 8
 
@@ -269,6 +270,23 @@ def _create_pretrained_backbone_fn(
         model,
         device="NPU",
         checkpoint_path=checkpoint_path,
+    )
+
+
+def _create_codec_encode_fn(
+    *,
+    codec: DACVAECodec,
+    codec_device: str | torch.device,
+) -> CodecEncodeFn | None:
+    if not _is_npu_device(codec_device):
+        return None
+    from .openvino_backend import create_dacvae_encoder_backend
+
+    return create_dacvae_encoder_backend(
+        codec.model,
+        device="NPU",
+        checkpoint_path=codec.checkpoint_path,
+        deterministic_encode=codec.deterministic_encode,
     )
 
 
@@ -695,6 +713,7 @@ class InferenceRuntime:
         default_max_ref_seconds: float = _LEGACY_MAX_REF_SECONDS,
         dit_forward_fn: Callable[..., torch.Tensor] | None = None,
         pretrained_backbone_fn: PretrainedBackboneFn | None = None,
+        codec_encode_fn: CodecEncodeFn | None = None,
         codec_decode_fn: CodecDecodeFn | None = None,
     ) -> None:
         self.key = key
@@ -704,11 +723,14 @@ class InferenceRuntime:
             raise ValueError("model_device='npu' requires an OpenVINO DiT backend.")
         if _is_npu_device(key.codec_device) and codec_decode_fn is None:
             raise ValueError("codec_device='npu' requires an OpenVINO DACVAE decoder backend.")
+        if _is_npu_device(key.codec_device) and codec_encode_fn is None:
+            raise ValueError("codec_device='npu' requires an OpenVINO DACVAE encoder backend.")
         self.model_cfg = model_cfg
         self.train_cfg = train_cfg
         self.model = model
         self.dit_forward_fn = dit_forward_fn
         self.pretrained_backbone_fn = pretrained_backbone_fn
+        self.codec_encode_fn = codec_encode_fn
         self.codec_decode_fn = codec_decode_fn
         self.tokenizer = tokenizer
         self.caption_tokenizer = caption_tokenizer
@@ -839,6 +861,10 @@ class InferenceRuntime:
                 f"Latent dimension mismatch: checkpoint latent_dim={model_cfg.latent_dim} but codec latent_dim={codec.latent_dim}. "
                 "Use a compatible codec/checkpoint pair."
             )
+        codec_encode_fn = _create_codec_encode_fn(
+            codec=codec,
+            codec_device=key.codec_device,
+        )
         codec_decode_fn = _create_codec_decode_fn(
             codec=codec,
             codec_device=key.codec_device,
@@ -857,6 +883,7 @@ class InferenceRuntime:
             default_max_ref_seconds=default_max_ref_seconds,
             dit_forward_fn=dit_forward_fn,
             pretrained_backbone_fn=pretrained_backbone_fn,
+            codec_encode_fn=codec_encode_fn,
             codec_decode_fn=codec_decode_fn,
         )
 
@@ -1059,6 +1086,7 @@ class InferenceRuntime:
                     sample_rate=int(sr),
                     normalize_db=req.ref_normalize_db,
                     ensure_max=bool(req.ref_ensure_max),
+                    encode_fn=self.codec_encode_fn,
                 ).cpu()
                 if piece.shape[1] == 0:
                     raise ValueError(f"Reference waveform produced an empty latent: {path}")
@@ -1634,6 +1662,7 @@ class InferenceRuntime:
     def unload(self) -> None:
         self.dit_forward_fn = None
         self.pretrained_backbone_fn = None
+        self.codec_encode_fn = None
         self.codec_decode_fn = None
         del self.model
         del self.tokenizer
