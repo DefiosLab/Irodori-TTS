@@ -4,7 +4,7 @@ import math
 import os
 import warnings
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,15 @@ _CONDITION_SEQUENCE_PROFILES = (
 _LATENT_SEQUENCE_BUCKETS = (48, 128, 256, 512, 768)
 _CODEC_ENCODER_BUCKETS = (40, 128, 256)
 _CODEC_DECODER_BUCKETS = (40, 80)
+
+
+def _iter_batch_inputs(inputs: tuple[torch.Tensor, ...]) -> Iterator[tuple[torch.Tensor, ...]]:
+    batch_size = inputs[0].shape[0]
+    if batch_size == 0 or any(tensor.shape[0] != batch_size for tensor in inputs):
+        raise ValueError("OpenVINO inputs must have matching, non-empty batch dimensions.")
+    # Keep compiled batch shapes at one, including independent CFG branches.
+    for index in range(batch_size):
+        yield tuple(tensor[index : index + 1].contiguous() for tensor in inputs)
 
 
 def _select_condition_profile(
@@ -391,6 +400,13 @@ class _OpenVINOBackendBase(ABC):
             self._compiled_models[signature] = compiled_model
         return compiled_model
 
+    def _run_batched(self, inputs: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        outputs = []
+        for batch_inputs in _iter_batch_inputs(inputs):
+            compiled_model = self._get_compiled_model(batch_inputs)
+            outputs.append(torch.from_numpy(compiled_model(batch_inputs)[0].copy()))
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
+
 
 class _OpenVINODACVAEBackend(_OpenVINOBackendBase):
     def __init__(self, *, device: str, checkpoint_path: str | Path) -> None:
@@ -420,23 +436,27 @@ class _OpenVINODACVAEBackend(_OpenVINOBackendBase):
                     (*window.shape[:-1], (width - valid_frames) * self._frame_size)
                 )
                 window = torch.cat((window, padding), dim=-1)
-            window = window.contiguous()
-            compiled_model = self._get_compiled_model((window,))
-            if frames > width and width <= 2 * self._context_frames:
-                raise RuntimeError("DACVAE bucket is too short for its convolution context.")
-            inputs = [window]
-            for port in compiled_model.inputs[1:]:
-                scale = int(port.any_name.removeprefix("codec_valid_"))
-                mask = value.new_zeros((1, 1, width * scale))
-                mask[..., : valid_frames * scale] = 1
-                inputs.append(mask)
-            output = compiled_model(inputs)[0]
-            output_frame_size = output.shape[-1] // width
-            end = frames if origin + width >= frames else origin + width - self._context_frames
-            piece = output[
-                ..., (cursor - origin) * output_frame_size : (end - origin) * output_frame_size
-            ]
-            pieces.append(torch.from_numpy(piece.copy()))
+            batch_pieces = []
+            for batch_inputs in _iter_batch_inputs((window,)):
+                compiled_model = self._get_compiled_model(batch_inputs)
+                if frames > width and width <= 2 * self._context_frames:
+                    raise RuntimeError("DACVAE bucket is too short for its convolution context.")
+                inputs = list(batch_inputs)
+                for port in compiled_model.inputs[1:]:
+                    scale = int(port.any_name.removeprefix("codec_valid_"))
+                    mask = value.new_zeros((1, 1, width * scale))
+                    mask[..., : valid_frames * scale] = 1
+                    inputs.append(mask)
+                output = compiled_model(inputs)[0]
+                output_frame_size = output.shape[-1] // width
+                end = frames if origin + width >= frames else origin + width - self._context_frames
+                piece = output[
+                    ..., (cursor - origin) * output_frame_size : (end - origin) * output_frame_size
+                ]
+                batch_pieces.append(torch.from_numpy(piece.copy()))
+            pieces.append(
+                batch_pieces[0] if len(batch_pieces) == 1 else torch.cat(batch_pieces, dim=0)
+            )
             cursor = end
         return torch.cat(pieces, dim=-1)
 
@@ -749,9 +769,8 @@ class OpenVINODiTBackend(_OpenVINOBackendBase):
             caption_state=caption_state,
             caption_mask=caption_mask,
         )
-        compiled_model = self._get_compiled_model(inputs)
-        output = compiled_model(inputs)[0]
-        return torch.from_numpy(output[:, :sequence_length].copy()).to(
+        output = self._run_batched(inputs)
+        return output[:, :sequence_length].to(
             device=x_t.device,
             dtype=x_t.dtype,
         )
@@ -833,7 +852,8 @@ class OpenVINOPretrainedTextBackboneBackend(_OpenVINOBackendBase):
                 "Pretrained text backbone input shape mismatch: "
                 f"input_ids={tuple(input_ids.shape)} mask={tuple(mask.shape)}"
             )
-        if not bool(mask.any()):
+        active_rows = mask.any(dim=1)
+        if not bool(active_rows.any()):
             return torch.zeros(
                 (*input_ids.shape, self.hidden_size),
                 dtype=self.dtype,
@@ -841,12 +861,14 @@ class OpenVINOPretrainedTextBackboneBackend(_OpenVINOBackendBase):
             )
         sequence_length = input_ids.shape[1]
         bucket_length = _select_condition_profile(sequence_length, 0, 0)[0]
-        inputs = _pad_condition_sequence(input_ids, mask, bucket_length)
-        compiled_model = self._get_compiled_model(inputs)
-        output = compiled_model(inputs)[0]
-        return torch.from_numpy(output[:, :sequence_length].copy()).to(
-            device=input_ids.device, dtype=self.dtype
-        )
+        inputs = _pad_condition_sequence(input_ids[active_rows], mask[active_rows], bucket_length)
+        output = self._run_batched(inputs)
+        output = output[:, :sequence_length].to(device=input_ids.device, dtype=self.dtype)
+        if bool(active_rows.all()):
+            return output
+        state = output.new_zeros((*input_ids.shape, self.hidden_size))
+        state[active_rows] = output
+        return state
 
 
 class OpenVINODACVAEEncoderBackend(_OpenVINODACVAEBackend):

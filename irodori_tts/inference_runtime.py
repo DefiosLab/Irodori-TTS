@@ -1224,6 +1224,7 @@ class InferenceRuntime:
         num_candidates = int(req.num_candidates)
         if num_candidates <= 0:
             raise ValueError(f"num_candidates must be > 0, got {num_candidates}")
+        condition_batch_size = 1 if _is_npu_device(self.key.model_device) else num_candidates
         decode_mode = str(req.decode_mode).strip().lower()
         if decode_mode not in {"sequential", "batch"}:
             raise ValueError(
@@ -1350,7 +1351,7 @@ class InferenceRuntime:
         ):
             t0 = _measure_start(self.model_device)
             text_ids, text_mask = self.tokenizer.batch_encode(
-                [normalized_text] * num_candidates,
+                [normalized_text] * condition_batch_size,
                 max_length=text_max_len,
             )
             text_ids, text_mask = _bucket_condition_inputs(text_ids, text_mask)
@@ -1368,7 +1369,7 @@ class InferenceRuntime:
                     )
                 caption_text = "" if req.caption is None else str(req.caption).strip()
                 caption_ids, caption_mask = self.caption_tokenizer.batch_encode(
-                    [caption_text] * num_candidates,
+                    [caption_text] * condition_batch_size,
                     max_length=caption_max_len,
                 )
                 if caption_text == "":
@@ -1387,13 +1388,13 @@ class InferenceRuntime:
                 speaker_mask_override,
             ) = self._load_speaker_embedding_condition(
                 req=req,
-                batch_size=num_candidates,
+                batch_size=condition_batch_size,
                 messages=messages,
             )
             if speaker_state_override is None:
                 ref_latent, ref_mask = self._load_reference_latent(
                     req=req,
-                    batch_size=num_candidates,
+                    batch_size=condition_batch_size,
                     messages=messages,
                 )
             else:
@@ -1439,14 +1440,14 @@ class InferenceRuntime:
             elif self.model_cfg.use_duration_predictor:
                 t0 = _measure_start(self.model_device)
                 has_speaker_duration = torch.zeros(
-                    (num_candidates,), dtype=torch.bool, device=self.model_device
+                    (condition_batch_size,), dtype=torch.bool, device=self.model_device
                 )
                 if speaker_mask_override is not None:
                     has_speaker_duration = speaker_mask_override.any(dim=1)
                 elif self.model_cfg.use_speaker_condition_resolved and ref_mask is not None:
                     has_speaker_duration = ref_mask.any(dim=1)
                 duration_features = build_duration_features(
-                    [normalized_text] * num_candidates,
+                    [normalized_text] * condition_batch_size,
                     token_counts=text_mask.sum(dim=1),
                     max_text_len=text_max_len,
                     has_speaker=has_speaker_duration,
@@ -1469,7 +1470,7 @@ class InferenceRuntime:
                     duration_features=duration_features,
                     has_speaker=has_speaker_duration,
                     has_caption=torch.full(
-                        (num_candidates,),
+                        (condition_batch_size,),
                         has_caption_text,
                         dtype=torch.bool,
                         device=self.model_device,
@@ -1514,6 +1515,13 @@ class InferenceRuntime:
                     _log(msg)
 
             t0 = _measure_start(self.model_device)
+            if condition_batch_size != num_candidates:
+                text_ids = text_ids.expand(num_candidates, -1)
+                text_mask = text_mask.expand(num_candidates, -1)
+                encoded_conditions = tuple(
+                    state.expand(num_candidates, *state.shape[1:]) if state is not None else None
+                    for state in encoded_conditions
+                )
             if self.model_cfg.flow_parameterization == "meanflow":
                 z_patched = sample_euler_meanflow(
                     model=self.model,
