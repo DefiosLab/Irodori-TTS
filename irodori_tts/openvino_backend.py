@@ -20,27 +20,10 @@ _CONDITION_SEQUENCE_PROFILES = (
     (128, 256, 128),
     (512, 1024, 512),
 )
-_LATENT_SEQUENCE_BUCKETS = (
-    8,
-    12,
-    16,
-    24,
-    32,
-    48,
-    64,
-    96,
-    128,
-    192,
-    256,
-    384,
-    512,
-    768,
-    1024,
-    1536,
-    2048,
-    3072,
-    4096,
-)
+# Five profiles cover the default generation limit of 30 seconds at 25 latent frames/s.
+_LATENT_SEQUENCE_BUCKETS = (48, 128, 256, 512, 768)
+_CODEC_ENCODER_BUCKETS = (40, 128, 256)
+_CODEC_DECODER_BUCKETS = (40, 80)
 
 
 def _select_condition_profile(
@@ -88,10 +71,7 @@ def _bucket_latent_input(x_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
         raise ValueError(f"Latent input must have shape (B,S,D) with S > 0, got {x_t.shape}.")
 
     sequence_length = x_t.shape[1]
-    bucket_length = next(
-        (length for length in _LATENT_SEQUENCE_BUCKETS if length >= sequence_length),
-        sequence_length,
-    )
+    bucket_length = _select_latent_bucket(sequence_length)
     latent_mask = torch.zeros(
         (x_t.shape[0], bucket_length),
         dtype=torch.bool,
@@ -105,6 +85,13 @@ def _bucket_latent_input(x_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
         (x_t.shape[0], bucket_length - sequence_length, x_t.shape[2])
     )
     return torch.cat((x_t, padding), dim=1), latent_mask
+
+
+def _select_latent_bucket(length: int) -> int:
+    for capacity in _LATENT_SEQUENCE_BUCKETS:
+        if length <= capacity:
+            return capacity
+    return 1 << (length - 1).bit_length()
 
 
 def _safe_cache_component(value: object) -> str:
@@ -167,6 +154,82 @@ def _replace_squared_sine_with_polynomial(ov: Any, model: Any) -> None:
         power_node.output(0).replace(approximation.output(0))
 
     model.validate_nodes_and_infer_types()
+
+
+def _codec_context_frames(model: Any, frame_size: int) -> int:
+    # Follow the longest convolution path, including residual branches, in input units.
+    fields: dict[Any, tuple[float, float, float]] = {model.input(0).get_node(): (1.0, 0.0, 0.0)}
+    for node in model.get_ordered_ops():
+        if node in fields or node.get_type_name() == "Constant":
+            continue
+        inputs = [
+            fields[value.get_node()] for value in node.input_values() if value.get_node() in fields
+        ]
+        if not inputs or len(node.output(0).get_shape()) != 3:
+            continue
+        step = inputs[0][0]
+        left = min(field[1] for field in inputs)
+        right = max(field[2] for field in inputs)
+        kind = node.get_type_name()
+        if kind in {"Convolution", "ConvolutionBackpropData"}:
+            attrs = node.get_attributes()
+            stride = attrs["strides"][0]
+            padding = attrs["pads_begin"][0]
+            kernel = (node.input_value(1).get_shape()[-1] - 1) * attrs["dilations"][0]
+            if kind == "Convolution":
+                left -= padding * step
+                right += (kernel - padding) * step
+                step *= stride
+            else:
+                step /= stride
+                left += (padding - kernel) * step
+                right += padding * step
+        fields[node] = (step, left, right)
+    _, left, right = fields[model.output(0).get_node()]
+    # Include a full frame around fractional positions in transposed convolutions.
+    return math.ceil(max(-left, right) / frame_size) + 1
+
+
+def _mask_codec_boundaries(ov: Any, model: Any, frames: int):
+    # Clear biased padding at every resolution before later convolutions can consume it.
+    masks: dict[int, Any] = {}
+    convolutions = [
+        node
+        for node in model.get_ordered_ops()
+        if node.get_type_name() in {"Convolution", "ConvolutionBackpropData"}
+    ]
+    for conv in convolutions:
+        output = conv.output(0)
+        targets = list(output.get_target_inputs())
+        if len(targets) == 1:
+            target = targets[0]
+            bias = target.get_node()
+            if (
+                bias.get_type_name() == "Add"
+                and bias.input_value(1 - target.get_index()).get_node().get_type_name()
+                == "Constant"
+            ):
+                output = bias.output(0)
+        length = output.get_shape()[-1]
+        if length % frames:
+            raise RuntimeError("DACVAE convolution lengths must align with latent frames.")
+        scale = length // frames
+        if scale not in masks:
+            masks[scale] = ov.opset13.parameter(
+                [1, 1, length], output.get_element_type(), name=f"codec_valid_{scale}"
+            )
+        targets = list(output.get_target_inputs())
+        masked = ov.opset13.multiply(output, masks[scale])
+        masked.set_friendly_name(f"{conv.get_friendly_name()}/boundary_mask")
+        for target in targets:
+            target.replace_source_output(masked.output(0))
+    result = ov.Model(
+        model.get_results(),
+        model.get_parameters() + [masks[scale] for scale in sorted(masks)],
+        model.get_friendly_name(),
+    )
+    result.validate_nodes_and_infer_types()
+    return result
 
 
 class _OpenVINOBackendBase(ABC):
@@ -292,7 +355,7 @@ class _OpenVINOBackendBase(ABC):
         self._ir_model = model
         return model
 
-    def _compile(self, inputs: tuple[torch.Tensor, ...]):
+    def _prepare_model(self, inputs: tuple[torch.Tensor, ...]):
         if (
             self._ir_dir is not None
             and not self._dynamic_ir_unavailable
@@ -315,7 +378,10 @@ class _OpenVINOBackendBase(ABC):
                 for port, tensor in zip(ov_model.inputs, inputs, strict=True)
             }
         )
-        return self.core.compile_model(ov_model, self.device)
+        return ov_model
+
+    def _compile(self, inputs: tuple[torch.Tensor, ...]):
+        return self.core.compile_model(self._prepare_model(inputs), self.device)
 
     def _get_compiled_model(self, inputs: tuple[torch.Tensor, ...]):
         signature = tuple((tuple(tensor.shape), tensor.dtype) for tensor in inputs)
@@ -324,6 +390,55 @@ class _OpenVINOBackendBase(ABC):
             compiled_model = self._compile(inputs)
             self._compiled_models[signature] = compiled_model
         return compiled_model
+
+
+class _OpenVINODACVAEBackend(_OpenVINOBackendBase):
+    def __init__(self, *, device: str, checkpoint_path: str | Path) -> None:
+        self._context_frames = 0
+        super().__init__(device=device, checkpoint_path=checkpoint_path)
+
+    def _prepare_model(self, inputs: tuple[torch.Tensor, ...]):
+        model = super()._prepare_model(inputs)
+        self._context_frames = _codec_context_frames(model, self._frame_size)
+        return _mask_codec_boundaries(self.ov, model, inputs[0].shape[-1] // self._frame_size)
+
+    def _run_bucketed(self, value: torch.Tensor, buckets: tuple[int, ...]) -> torch.Tensor:
+        frames = value.shape[-1] // self._frame_size
+        if frames == 0:
+            raise ValueError("DACVAE inputs must contain at least one latent frame.")
+        pieces = []
+        cursor = 0
+        while cursor < frames:
+            remaining = frames - cursor + (self._context_frames if cursor else 0)
+            width = next((capacity for capacity in buckets if capacity >= remaining), buckets[-1])
+            # Align the final window with the real boundary and crop overlapping context.
+            origin = max(0, min(cursor - self._context_frames, frames - width))
+            window = value[..., origin * self._frame_size : (origin + width) * self._frame_size]
+            valid_frames = window.shape[-1] // self._frame_size
+            if valid_frames < width:
+                padding = window.new_zeros(
+                    (*window.shape[:-1], (width - valid_frames) * self._frame_size)
+                )
+                window = torch.cat((window, padding), dim=-1)
+            window = window.contiguous()
+            compiled_model = self._get_compiled_model((window,))
+            if frames > width and width <= 2 * self._context_frames:
+                raise RuntimeError("DACVAE bucket is too short for its convolution context.")
+            inputs = [window]
+            for port in compiled_model.inputs[1:]:
+                scale = int(port.any_name.removeprefix("codec_valid_"))
+                mask = value.new_zeros((1, 1, width * scale))
+                mask[..., : valid_frames * scale] = 1
+                inputs.append(mask)
+            output = compiled_model(inputs)[0]
+            output_frame_size = output.shape[-1] // width
+            end = frames if origin + width >= frames else origin + width - self._context_frames
+            piece = output[
+                ..., (cursor - origin) * output_frame_size : (end - origin) * output_frame_size
+            ]
+            pieces.append(torch.from_numpy(piece.copy()))
+            cursor = end
+        return torch.cat(pieces, dim=-1)
 
 
 class _RFDiTExportWrapper(torch.nn.Module):
@@ -734,7 +849,7 @@ class OpenVINOPretrainedTextBackboneBackend(_OpenVINOBackendBase):
         )
 
 
-class OpenVINODACVAEEncoderBackend(_OpenVINOBackendBase):
+class OpenVINODACVAEEncoderBackend(_OpenVINODACVAEBackend):
     def __init__(
         self,
         model: torch.nn.Module,
@@ -747,6 +862,7 @@ class OpenVINODACVAEEncoderBackend(_OpenVINOBackendBase):
         self.wrapper = _DACVAEEncoderExportWrapper(self.model).eval()
         self.dtype = next(self.model.parameters()).dtype
         self.hop_length = int(self.model.hop_length)
+        self._frame_size = self.hop_length
         self.deterministic_encode = deterministic_encode
         super().__init__(device=device, checkpoint_path=checkpoint_path)
 
@@ -789,9 +905,8 @@ class OpenVINODACVAEEncoderBackend(_OpenVINOBackendBase):
             raise ValueError(f"Expected mono waveform shape (B,1,T), got {tuple(waveform.shape)}")
         waveform = waveform.contiguous().to(device="cpu", dtype=self.dtype)
         waveform = self.model._pad(waveform)
-        compiled_model = self._get_compiled_model((waveform,))
-        output = compiled_model((waveform,))[0]
-        mean, scale = torch.from_numpy(output.copy()).chunk(2, dim=1)
+        output = self._run_bucketed(waveform, _CODEC_ENCODER_BUCKETS)
+        mean, scale = output.chunk(2, dim=1)
         if self.deterministic_encode:
             encoded = mean
         else:
@@ -799,7 +914,7 @@ class OpenVINODACVAEEncoderBackend(_OpenVINOBackendBase):
         return encoded.transpose(1, 2).contiguous()
 
 
-class OpenVINODACVAEDecoderBackend(_OpenVINOBackendBase):
+class OpenVINODACVAEDecoderBackend(_OpenVINODACVAEBackend):
     def __init__(
         self,
         model: torch.nn.Module,
@@ -810,6 +925,7 @@ class OpenVINODACVAEDecoderBackend(_OpenVINOBackendBase):
         self.model = model.eval()
         self.wrapper = _DACVAEDecoderExportWrapper(self.model).eval()
         self.dtype = next(self.model.parameters()).dtype
+        self._frame_size = 1
         super().__init__(device=device, checkpoint_path=checkpoint_path)
 
     @property
@@ -854,9 +970,7 @@ class OpenVINODACVAEDecoderBackend(_OpenVINOBackendBase):
         if latent.ndim != 3:
             raise ValueError(f"Expected latent ndim=3, got shape={tuple(latent.shape)}")
         z = latent.transpose(1, 2).contiguous().to(device="cpu", dtype=self.dtype)
-        compiled_model = self._get_compiled_model((z,))
-        output = compiled_model((z,))[0]
-        return torch.from_numpy(output.copy())
+        return self._run_bucketed(z, _CODEC_DECODER_BUCKETS)
 
 
 def create_dit_backend(
