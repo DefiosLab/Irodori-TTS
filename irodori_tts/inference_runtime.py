@@ -9,7 +9,7 @@ import threading
 import time
 from collections.abc import Callable
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -654,7 +654,7 @@ def _split_hf_checkpoint_source(source: str) -> tuple[str, str | None]:
     return "/".join(parts[:2]), "/".join(parts[2:])
 
 
-def download_hf_checkpoint(source: str) -> str:
+def _download_hf_checkpoint(source: str) -> str:
     """Download an Irodori checkpoint and any bundled tokenizer assets.
 
     ``source`` accepts either a Hugging Face repo id or ``repo_id/subfolder``.
@@ -887,6 +887,56 @@ class InferenceRuntime:
             codec_decode_fn=codec_decode_fn,
         )
 
+    def _prepare_openvino_backends(self) -> None:
+        npu_model = _is_npu_device(self.key.model_device)
+        npu_codec = _is_npu_device(self.key.codec_device)
+        if not (npu_model or npu_codec):
+            return
+
+        started = time.perf_counter()
+        print("[openvino] preparing NPU inference profiles...", flush=True)
+        if npu_model:
+            from .openvino_backend import _CONDITION_SEQUENCE_PROFILES
+
+            # Include checkpoint defaults as well as all standard inference profiles.
+            max_text, max_speaker, max_caption = _CONDITION_SEQUENCE_PROFILES[-1]
+            frames_per_second = self.codec.sample_rate / self.codec.model.hop_length
+            speaker_length = 0
+            if self.model_cfg.use_speaker_condition_resolved:
+                reference_frames = math.ceil(self.default_max_ref_seconds * frames_per_second)
+                speaker_length = (
+                    reference_frames
+                    // self.model_cfg.latent_patch_size
+                    // self.model_cfg.speaker_patch_size
+                    + 1  # The reference encoder prepends a summary token.
+                )
+            text_length = max(max_text, self.default_text_max_len)
+            caption_length = (
+                max(max_caption, self.default_caption_max_len)
+                if self.model_cfg.use_caption_condition
+                else 0
+            )
+            self.dit_forward_fn.prepare_eager_profiles(
+                max_sequence_length=math.ceil(
+                    SamplingRequest.max_seconds
+                    * frames_per_second
+                    / self.model_cfg.latent_patch_size
+                ),
+                max_condition_lengths=(
+                    text_length,
+                    max(max_speaker, speaker_length),
+                    caption_length,
+                ),
+            )
+            if self.pretrained_backbone_fn is not None:
+                self.pretrained_backbone_fn.prepare_eager_profiles(
+                    max_sequence_lengths=(text_length, max(1, caption_length)),
+                )
+        if npu_codec:
+            self.codec_encode_fn.prepare_eager_profiles()
+            self.codec_decode_fn.prepare_eager_profiles()
+        print(f"[openvino] NPU ready ({time.perf_counter() - started:.2f}s).", flush=True)
+
     def _resolve_lora_adapter_path(self, adapter_path: str | None) -> str | None:
         if adapter_path is None:
             return None
@@ -949,6 +999,11 @@ class InferenceRuntime:
 
         if self.key.compile_model:
             raise RuntimeError("Dynamic LoRA loading is not compatible with compile_model=True.")
+        if _is_npu_device(self.key.model_device):
+            raise RuntimeError(
+                "Dynamic LoRA loading is not compatible with model_device='npu'. "
+                "Use a checkpoint with the adapter merged before NPU preparation."
+            )
 
         adapter_name = self._lora_adapter_names.get(resolved_path)
         if adapter_name is None:
@@ -1689,6 +1744,34 @@ class InferenceRuntime:
                     xpu.empty_cache()
 
 
+def acquire_runtime(key: RuntimeKey) -> InferenceRuntime:
+    """Acquire a local or Hugging Face checkpoint and complete NPU preparation."""
+    source = str(key.checkpoint).strip()
+    if not source:
+        raise ValueError("checkpoint is required.")
+    local_path = Path(source).expanduser()
+    if local_path.is_file() or local_path.suffix.lower() in {".pt", ".safetensors"}:
+        if not local_path.is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {local_path}")
+        checkpoint_path = str(local_path)
+        print(f"[checkpoint] using local file: {checkpoint_path}", flush=True)
+    else:
+        checkpoint_path = _download_hf_checkpoint(source)
+        print(
+            f"[checkpoint] downloaded model.safetensors from hf://{source} -> {checkpoint_path}",
+            flush=True,
+        )
+
+    runtime = InferenceRuntime.from_key(replace(key, checkpoint=checkpoint_path))
+    try:
+        runtime._prepare_openvino_backends()
+    except Exception:
+        runtime.unload()
+        raise
+    print(f"[checkpoint] model ready: {checkpoint_path}", flush=True)
+    return runtime
+
+
 _RUNTIME_CACHE_LOCK = threading.Lock()
 _RUNTIME_CACHE_KEY: RuntimeKey | None = None
 _RUNTIME_CACHE_VALUE: InferenceRuntime | None = None
@@ -1701,7 +1784,7 @@ def get_cached_runtime(key: RuntimeKey) -> tuple[InferenceRuntime, bool]:
             return _RUNTIME_CACHE_VALUE, False
 
         old_runtime = _RUNTIME_CACHE_VALUE
-        runtime = InferenceRuntime.from_key(key)
+        runtime = acquire_runtime(key)
         _RUNTIME_CACHE_KEY = key
         _RUNTIME_CACHE_VALUE = runtime
 

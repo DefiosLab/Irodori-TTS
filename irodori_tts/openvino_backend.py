@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
@@ -24,6 +25,28 @@ _CONDITION_SEQUENCE_PROFILES = (
 _LATENT_SEQUENCE_BUCKETS = (48, 128, 256, 512, 768)
 _CODEC_ENCODER_BUCKETS = (40, 128, 256)
 _CODEC_DECODER_BUCKETS = (40, 80)
+
+
+def _condition_profiles_up_to(lengths: tuple[int, int, int]) -> tuple[tuple[int, int, int], ...]:
+    largest = _select_condition_profile(*lengths)
+    profiles = []
+    for profile in _CONDITION_SEQUENCE_PROFILES:
+        profiles.append(profile)
+        if profile == largest:
+            return tuple(profiles)
+    while profiles[-1] != largest:
+        profiles.append(tuple(capacity * 2 for capacity in profiles[-1]))
+    return tuple(profiles)
+
+
+def _latent_buckets_up_to(length: int) -> tuple[int, ...]:
+    if length <= 0:
+        raise ValueError("Maximum latent sequence length must be positive.")
+    largest = _select_latent_bucket(length)
+    buckets = [capacity for capacity in _LATENT_SEQUENCE_BUCKETS if capacity <= largest]
+    while buckets[-1] < largest:
+        buckets.append(_select_latent_bucket(buckets[-1] + 1))
+    return tuple(buckets)
 
 
 def _iter_batch_inputs(inputs: tuple[torch.Tensor, ...]) -> Iterator[tuple[torch.Tensor, ...]]:
@@ -264,6 +287,7 @@ class _OpenVINOBackendBase(ABC):
         self._compiled_models: dict[
             tuple[tuple[tuple[int, ...], torch.dtype], ...], Any
         ] = {}
+        self._warmed_profiles: set[tuple[tuple[tuple[int, ...], torch.dtype], ...]] = set()
         self._initialize_cache(Path(checkpoint_path))
 
     @property
@@ -289,6 +313,10 @@ class _OpenVINOBackendBase(ABC):
             raise RuntimeError("OpenVINO IR cache is not initialized.")
         return self._ir_dir / self._ir_filename
 
+    @property
+    def _cache_mode(self) -> str:
+        return "OPTIMIZE_SIZE"
+
     def _initialize_cache(self, checkpoint_path: Path) -> None:
         try:
             checkpoint_path = checkpoint_path.expanduser()
@@ -306,10 +334,10 @@ class _OpenVINOBackendBase(ABC):
             self._ir_dir = cache_root / cache_key
             compiled_dir = self._ir_dir / "compiled"
             compiled_dir.mkdir(parents=True, exist_ok=True)
-            self.core.set_property(
-                self.device,
-                {self.ov.properties.cache_dir(): str(compiled_dir)},
-            )
+            properties = {self.ov.properties.cache_dir(): str(compiled_dir)}
+            if self.device == "NPU":
+                properties[self.ov.properties.cache_mode()] = self._cache_mode
+            self.core.set_property(self.device, properties)
         except (OSError, RuntimeError) as exc:
             warnings.warn(
                 f"Could not initialize OpenVINO cache next to {checkpoint_path}: {exc}",
@@ -407,16 +435,71 @@ class _OpenVINOBackendBase(ABC):
             outputs.append(torch.from_numpy(compiled_model(batch_inputs)[0].copy()))
         return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
 
+    def _warmup(self, compiled_model, inputs: tuple[torch.Tensor, ...]) -> None:
+        compiled_model(inputs)
+
+    def _prepare_profiles(
+        self,
+        profiles: list[tuple[torch.Tensor, ...]],
+        *,
+        log_fn: Callable[[str], None] | None,
+    ) -> None:
+        if log_fn is None:
+
+            def log_fn(message: str) -> None:
+                print(message, flush=True)
+
+        for index, inputs in enumerate(profiles, start=1):
+            signature = tuple((tuple(tensor.shape), tensor.dtype) for tensor in inputs)
+            if signature in self._warmed_profiles:
+                continue
+            prefix = f"[openvino] {self._ir_filename} [{index}/{len(profiles)}]"
+            log_fn(f"{prefix} prepare: {[tuple(tensor.shape) for tensor in inputs]}")
+            started = time.perf_counter()
+            compiled_model = self._get_compiled_model(inputs)
+            compile_seconds = time.perf_counter() - started
+            started = time.perf_counter()
+            self._warmup(compiled_model, inputs)
+            self._warmed_profiles.add(signature)
+            log_fn(
+                f"{prefix} ready: cache={compiled_model.get_property('LOADED_FROM_CACHE')}, "
+                f"load/compile={compile_seconds:.2f}s, warmup={time.perf_counter() - started:.2f}s"
+            )
+
 
 class _OpenVINODACVAEBackend(_OpenVINOBackendBase):
     def __init__(self, *, device: str, checkpoint_path: str | Path) -> None:
         self._context_frames = 0
         super().__init__(device=device, checkpoint_path=checkpoint_path)
 
+    @property
+    def _cache_mode(self) -> str:
+        # Retain transformed convolution weights to keep codec compilation inexpensive.
+        return "OPTIMIZE_SPEED"
+
     def _prepare_model(self, inputs: tuple[torch.Tensor, ...]):
         model = super()._prepare_model(inputs)
         self._context_frames = _codec_context_frames(model, self._frame_size)
         return _mask_codec_boundaries(self.ov, model, inputs[0].shape[-1] // self._frame_size)
+
+    def _masked_inputs(
+        self,
+        compiled_model,
+        value: torch.Tensor,
+        valid_frames: int,
+    ) -> list[torch.Tensor]:
+        inputs = [value]
+        width = value.shape[-1] // self._frame_size
+        for port in compiled_model.inputs[1:]:
+            scale = int(port.any_name.removeprefix("codec_valid_"))
+            mask = value.new_zeros((1, 1, width * scale))
+            mask[..., : valid_frames * scale] = 1
+            inputs.append(mask)
+        return inputs
+
+    def _warmup(self, compiled_model, inputs: tuple[torch.Tensor, ...]) -> None:
+        value = inputs[0]
+        compiled_model(self._masked_inputs(compiled_model, value, value.shape[-1] // self._frame_size))
 
     def _run_bucketed(self, value: torch.Tensor, buckets: tuple[int, ...]) -> torch.Tensor:
         frames = value.shape[-1] // self._frame_size
@@ -441,12 +524,7 @@ class _OpenVINODACVAEBackend(_OpenVINOBackendBase):
                 compiled_model = self._get_compiled_model(batch_inputs)
                 if frames > width and width <= 2 * self._context_frames:
                     raise RuntimeError("DACVAE bucket is too short for its convolution context.")
-                inputs = list(batch_inputs)
-                for port in compiled_model.inputs[1:]:
-                    scale = int(port.any_name.removeprefix("codec_valid_"))
-                    mask = value.new_zeros((1, 1, width * scale))
-                    mask[..., : valid_frames * scale] = 1
-                    inputs.append(mask)
+                inputs = self._masked_inputs(compiled_model, batch_inputs[0], valid_frames)
                 output = compiled_model(inputs)[0]
                 output_frame_size = output.shape[-1] // width
                 end = frames if origin + width >= frames else origin + width - self._context_frames
@@ -742,6 +820,54 @@ class OpenVINODiTBackend(_OpenVINOBackendBase):
             exported = torch.export.export(wrapper, inputs)
         return self.ov.convert_model(exported)
 
+    @torch.inference_mode()
+    def prepare_eager_profiles(
+        self,
+        *,
+        max_sequence_length: int = _LATENT_SEQUENCE_BUCKETS[-1],
+        max_condition_lengths: tuple[int, int, int] = _CONDITION_SEQUENCE_PROFILES[-1],
+        log_fn: Callable[[str], None] | None = None,
+    ) -> None:
+        cfg = self.model.cfg
+        parameter = next(self.model.parameters())
+
+        def condition(length: int, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+            state = parameter.new_zeros((1, length, dim))
+            mask = torch.ones((1, length), dtype=torch.bool, device=parameter.device)
+            return state, mask
+
+        profiles = []
+        latent_buckets = _latent_buckets_up_to(max_sequence_length)
+        for text_length, speaker_length, caption_length in _condition_profiles_up_to(
+            max_condition_lengths
+        ):
+            text_state, text_mask = condition(text_length, cfg.text_dim)
+            speaker_state, speaker_mask = (
+                condition(speaker_length, cfg.speaker_dim)
+                if cfg.use_speaker_condition_resolved
+                else (None, None)
+            )
+            caption_state, caption_mask = (
+                condition(caption_length, cfg.caption_dim_resolved)
+                if cfg.use_caption_condition
+                else (None, None)
+            )
+            for length in latent_buckets:
+                profiles.append(
+                    self._prepare_inputs(
+                        x_t=parameter.new_zeros((1, length, cfg.patched_latent_dim)),
+                        t=parameter.new_full((1,), 0.5),
+                        delta_t=parameter.new_full((1,), 0.25) if self.is_meanflow else None,
+                        text_state=text_state,
+                        text_mask=text_mask,
+                        speaker_state=speaker_state,
+                        speaker_mask=speaker_mask,
+                        caption_state=caption_state,
+                        caption_mask=caption_mask,
+                    )
+                )
+        self._prepare_profiles(profiles, log_fn=log_fn)
+
     def __call__(
         self,
         *,
@@ -837,6 +963,26 @@ class OpenVINOPretrainedTextBackboneBackend(_OpenVINOBackendBase):
             exported = torch.export.export(self.backbone, inputs)
         return self.ov.convert_model(exported)
 
+    @torch.inference_mode()
+    def prepare_eager_profiles(
+        self,
+        *,
+        max_sequence_lengths: tuple[int, ...] = (_CONDITION_SEQUENCE_PROFILES[-1][0],),
+        log_fn: Callable[[str], None] | None = None,
+    ) -> None:
+        if not max_sequence_lengths or min(max_sequence_lengths) <= 0:
+            raise ValueError("Maximum condition sequence lengths must be positive.")
+        lengths = _condition_profiles_up_to((max(max_sequence_lengths), 0, 0))
+        device = next(self.backbone.parameters()).device
+        profiles = [
+            (
+                torch.zeros((1, profile[0]), dtype=torch.long, device=device),
+                torch.ones((1, profile[0]), dtype=torch.bool, device=device),
+            )
+            for profile in lengths
+        ]
+        self._prepare_profiles(profiles, log_fn=log_fn)
+
     def __call__(
         self,
         input_ids: torch.Tensor,
@@ -922,6 +1068,15 @@ class OpenVINODACVAEEncoderBackend(_OpenVINODACVAEBackend):
             exported = torch.export.export(self.wrapper, inputs)
         return self._convert_exported(exported)
 
+    @torch.inference_mode()
+    def prepare_eager_profiles(self, *, log_fn: Callable[[str], None] | None = None) -> None:
+        parameter = next(self.model.parameters())
+        profiles = [
+            (parameter.new_zeros((1, 1, frames * self.hop_length)),)
+            for frames in _CODEC_ENCODER_BUCKETS
+        ]
+        self._prepare_profiles(profiles, log_fn=log_fn)
+
     def __call__(self, waveform: torch.Tensor) -> torch.Tensor:
         if waveform.ndim != 3 or waveform.shape[1] != 1:
             raise ValueError(f"Expected mono waveform shape (B,1,T), got {tuple(waveform.shape)}")
@@ -987,6 +1142,15 @@ class OpenVINODACVAEDecoderBackend(_OpenVINODACVAEBackend):
         with torch.inference_mode():
             exported = torch.export.export(self.wrapper, inputs)
         return self._convert_exported(exported)
+
+    @torch.inference_mode()
+    def prepare_eager_profiles(self, *, log_fn: Callable[[str], None] | None = None) -> None:
+        parameter = next(self.model.parameters())
+        latent_dim = int(self.model.quantizer.out_proj.in_channels)
+        profiles = [
+            (parameter.new_zeros((1, latent_dim, frames)),) for frames in _CODEC_DECODER_BUCKETS
+        ]
+        self._prepare_profiles(profiles, log_fn=log_fn)
 
     def __call__(self, latent: torch.Tensor) -> torch.Tensor:
         if latent.ndim != 3:
