@@ -26,6 +26,7 @@ _CONDITION_SEQUENCE_PROFILES = (
 _LATENT_SEQUENCE_BUCKETS = (48, 128, 256, 512, 768)
 _CODEC_ENCODER_BUCKETS = (40, 128, 256)
 _CODEC_DECODER_BUCKETS = (40, 80)
+_WATERMARK_SEQUENCE_BUCKETS = (32, 64, 192, 384, 672)
 # Per backend; retain both decoder windows and common text/caption profiles.
 _MAX_RESIDENT_NPU_MODELS = 2
 _MAX_CONTEXT_KV_CACHES = 4  # Conditional input plus text/speaker/caption CFG branches.
@@ -741,6 +742,71 @@ class _DACVAEDecoderExportWrapper(torch.nn.Module):
         for layer in self.decoder_layers:
             x = layer(x)
         return self.output_layers(x)
+
+
+class _SilentCipherLayerExportWrapper(torch.nn.Module):
+    def __init__(self, layer: torch.nn.Module) -> None:
+        super().__init__()
+        self.conv = layer.conv
+        self.gate = layer.gate
+        self.register_buffer("weight", layer.bn.weight.detach().reshape(1, -1, 1, 1))
+        self.register_buffer("bias", layer.bn.bias.detach().reshape(1, -1, 1, 1))
+        self.eps = layer.bn.eps
+
+    def forward(
+        self, value: torch.Tensor, mask: torch.Tensor, valid_fraction: torch.Tensor
+    ) -> torch.Tensor:
+        hidden = self.conv(value) * torch.sigmoid(self.gate(value))
+        scale = (hidden * mask).abs().amax(dim=(0, 2, 3), keepdim=True).clamp_min(64.0) / 64.0
+        scaled = hidden / scale
+        mean = (scaled * mask).mean(dim=(0, 2, 3), keepdim=True) / valid_fraction
+        centered = (scaled - mean) * mask
+        variance = (
+            centered.square().mean(dim=(0, 2, 3), keepdim=True) / valid_fraction * scale * scale
+        )
+        normalized = centered * scale * torch.rsqrt(variance + self.eps) * self.weight + self.bias
+        return normalized * mask
+
+
+class _SilentCipherExportWrapper(torch.nn.Module):
+    def __init__(self, encoder: torch.nn.Module, decoder: torch.nn.Module) -> None:
+        super().__init__()
+        self.encoder = torch.nn.ModuleList(
+            _SilentCipherLayerExportWrapper(layer) for layer in encoder.main
+        )
+        self.decoder = torch.nn.ModuleList(
+            _SilentCipherLayerExportWrapper(layer) for layer in decoder.main
+        )
+        self.projection = encoder.linear
+        self.frequency_padding = encoder.n_fft // 2 + 1 - encoder.message_band_size
+        self.channels = encoder.main[-1].conv.out_channels
+
+    def forward(
+        self,
+        carrier: torch.Tensor,
+        messages: torch.Tensor,
+        mask: torch.Tensor,
+        valid_fraction: torch.Tensor,
+    ) -> torch.Tensor:
+        encoded = carrier * mask
+        for layer in self.encoder:
+            encoded = layer(encoded, mask, valid_fraction)
+        projected = self.projection(messages.transpose(2, 3)).transpose(2, 3)
+        projected = torch.nn.functional.pad(projected, (0, 0, 0, self.frequency_padding)) * mask
+        hidden = (
+            torch.cat(
+                (
+                    encoded,
+                    carrier.repeat(1, self.channels, 1, 1),
+                    projected.repeat(1, self.channels, 1, 1),
+                ),
+                dim=1,
+            )
+            * mask
+        )
+        for layer in self.decoder:
+            hidden = layer(hidden, mask, valid_fraction)
+        return hidden
 
 
 class _OpenVINOContextKVBackend(_OpenVINOBackendBase):
@@ -1609,6 +1675,91 @@ class OpenVINODACVAEDecoderBackend(_OpenVINODACVAEBackend):
         return self._run_bucketed(z, _CODEC_DECODER_BUCKETS)
 
 
+class OpenVINOSilentCipherBackend(_OpenVINOBackendBase):
+    def __init__(
+        self,
+        encoder: torch.nn.Module,
+        decoder: torch.nn.Module,
+        *,
+        device: str,
+        checkpoint_path: str | Path,
+    ) -> None:
+        self.wrapper = _SilentCipherExportWrapper(encoder, decoder).eval()
+        self.dtype = next(self.wrapper.parameters()).dtype
+        self.frequency_bins = encoder.n_fft // 2 + 1
+        self.message_dim = encoder.linear.in_features
+        self.max_sequence_length = _WATERMARK_SEQUENCE_BUCKETS[-1]
+        super().__init__(device=device, checkpoint_path=checkpoint_path)
+
+    @property
+    def _ir_filename(self) -> str:
+        return "silentcipher.xml"
+
+    @property
+    def _cache_mode(self) -> str:
+        return "OPTIMIZE_SPEED"
+
+    def _supports_dynamic_ir(self, inputs: tuple[torch.Tensor, ...]) -> bool:
+        return inputs[0].shape[-1] <= self.max_sequence_length
+
+    def _export_dynamic_ir(self, inputs: tuple[torch.Tensor, ...]):
+        sequence = torch.export.Dim("frames", min=1, max=self.max_sequence_length)
+        with torch.inference_mode():
+            exported = torch.export.export(
+                self.wrapper,
+                inputs,
+                dynamic_shapes=({3: sequence}, {3: sequence}, {3: sequence}, {}),
+            )
+        return self.ov.convert_model(exported)
+
+    def _convert_static(self, inputs: tuple[torch.Tensor, ...]):
+        with torch.inference_mode():
+            exported = torch.export.export(self.wrapper, inputs)
+        return self.ov.convert_model(exported)
+
+    @torch.inference_mode()
+    def prepare_eager_profiles(self, *, log_fn: Callable[[str], None] | None = None) -> None:
+        parameter = next(self.wrapper.parameters())
+        profiles = [
+            (
+                parameter.new_zeros((1, 1, self.frequency_bins, frames)),
+                parameter.new_zeros((1, 1, self.message_dim, frames)),
+                parameter.new_ones((1, 1, 1, frames)),
+                parameter.new_ones((1, 1, 1, 1)),
+            )
+            for frames in _WATERMARK_SEQUENCE_BUCKETS
+        ]
+        self._prepare_profiles(profiles, log_fn=log_fn)
+
+    @torch.inference_mode()
+    def __call__(self, carrier: torch.Tensor, messages: torch.Tensor) -> torch.Tensor:
+        if carrier.ndim != 4 or carrier.shape[:3] != (1, 1, self.frequency_bins):
+            raise ValueError(
+                f"Expected carrier shape (1,1,{self.frequency_bins},T), got {carrier.shape}."
+            )
+        frames = carrier.shape[-1]
+        if messages.shape != (1, 1, self.message_dim, frames):
+            raise ValueError(
+                f"Expected message shape (1,1,{self.message_dim},{frames}), got {messages.shape}."
+            )
+        if not 0 < frames <= self.max_sequence_length:
+            raise ValueError(
+                f"Watermark sequence length must be between 1 and {self.max_sequence_length}."
+            )
+        capacity = next(length for length in _WATERMARK_SEQUENCE_BUCKETS if frames <= length)
+        carrier = carrier.contiguous().to(device="cpu", dtype=self.dtype)
+        messages = messages.contiguous().to(device="cpu", dtype=self.dtype)
+        mask = carrier.new_zeros((1, 1, 1, capacity))
+        mask[..., :frames] = 1
+        inputs = (
+            torch.nn.functional.pad(carrier, (0, capacity - frames)),
+            torch.nn.functional.pad(messages, (0, capacity - frames)),
+            mask,
+            carrier.new_full((1, 1, 1, 1), frames / capacity),
+        )
+        return self._run_batched(inputs)[..., :frames].contiguous()
+
+
 def create_dit_backend(
     model: TextToLatentRFDiT,
     *,
@@ -1658,6 +1809,21 @@ def create_dacvae_decoder_backend(
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     return OpenVINODACVAEDecoderBackend(
         model,
+        device=device,
+        checkpoint_path=checkpoint_path,
+    )
+
+
+def create_silentcipher_backend(
+    encoder: torch.nn.Module,
+    decoder: torch.nn.Module,
+    *,
+    device: str,
+    checkpoint_path: str | Path,
+) -> OpenVINOSilentCipherBackend:
+    return OpenVINOSilentCipherBackend(
+        encoder,
+        decoder,
         device=device,
         checkpoint_path=checkpoint_path,
     )

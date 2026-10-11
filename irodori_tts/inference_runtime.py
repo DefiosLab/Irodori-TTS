@@ -746,7 +746,7 @@ class InferenceRuntime:
         self.default_text_max_len = default_text_max_len
         self.default_caption_max_len = default_caption_max_len
         self.default_max_ref_seconds = float(default_max_ref_seconds)
-        self.watermarker = SilentCipherWatermarker(device=str(self.codec_device))
+        self.watermarker = SilentCipherWatermarker(device=key.codec_device)
         self._infer_lock = threading.Lock()
         self._model_dtype = next(self.model.parameters()).dtype
         self._lora_adapter_names: dict[str, str] = {}
@@ -949,6 +949,7 @@ class InferenceRuntime:
         if npu_codec:
             self.codec_encode_fn.prepare_eager_profiles()
             self.codec_decode_fn.prepare_eager_profiles()
+            self.watermarker.prepare_eager_profiles()
         print(f"[openvino] NPU ready ({time.perf_counter() - started:.2f}s).", flush=True)
 
     def _resolve_lora_adapter_path(self, adapter_path: str | None) -> str | None:
@@ -1809,6 +1810,7 @@ class InferenceRuntime:
         del self.model
         del self.tokenizer
         del self.codec
+        del self.watermarker
         gc.collect()
         for device in (self.model_device, self.codec_device):
             if device.type == "cuda":
