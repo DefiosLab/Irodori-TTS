@@ -156,27 +156,21 @@ def _replace_squared_sine_with_polynomial(ov: Any, model: Any) -> None:
         type_name = element_type.get_type_name()
         constants = constants_by_type.get(type_name)
         if constants is None:
-            # Reduce by the pi-period of sin^2, then evaluate its degree-12 Taylor series.
             coefficients = (
                 1.0 / math.pi,
-                0.5,
                 math.pi,
-                -2.0 / 467775.0,
-                2.0 / 14175.0,
-                -1.0 / 315.0,
-                2.0 / 45.0,
-                -1.0 / 3.0,
-                1.0,
+                -0.002423022697067143,
+                0.04295343047848664,
+                -0.33214428172806304,
+                0.999703164102684,
             )
             constants = tuple(
                 ov.opset13.constant(coefficient, element_type) for coefficient in coefficients
             )
             constants_by_type[type_name] = constants
-        inv_pi, half, pi, *polynomial_coefficients = constants
 
-        periods = ov.opset13.floor(
-            ov.opset13.add(ov.opset13.multiply(value, inv_pi), half)
-        )
+        inv_pi, pi, *polynomial_coefficients = constants
+        periods = ov.opset13.round(ov.opset13.multiply(value, inv_pi), "half_to_even")
         reduced = ov.opset13.subtract(value, ov.opset13.multiply(periods, pi))
         squared = ov.opset13.multiply(reduced, reduced)
         polynomial = polynomial_coefficients[0]
@@ -1552,7 +1546,7 @@ class OpenVINODACVAEEncoderBackend(_OpenVINODACVAEBackend):
 
     @property
     def _ir_filename(self) -> str:
-        return "dacvae_encoder_poly.xml"
+        return "dacvae_encoder_minimax.xml"
 
     def _convert_exported(self, exported: torch.export.ExportedProgram):
         model = self.ov.convert_model(exported)
@@ -1623,7 +1617,7 @@ class OpenVINODACVAEDecoderBackend(_OpenVINODACVAEBackend):
 
     @property
     def _ir_filename(self) -> str:
-        return "dacvae_decoder_poly.xml"
+        return "dacvae_decoder_minimax.xml"
 
     def _convert_exported(self, exported: torch.export.ExportedProgram):
         model = self.ov.convert_model(exported)
