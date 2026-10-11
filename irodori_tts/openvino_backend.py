@@ -282,6 +282,86 @@ def _pack_dacvae_polynomials(ov: Any, model: Any) -> dict[str, dict[str, Any]]:
     return strategy
 
 
+def _fold_dacvae_dilated_convolutions(ov: Any, model: Any) -> None:
+    op = ov.opset13
+    for node in model.get_ordered_ops():
+        if node.get_type_name() != "Convolution":
+            continue
+        value, weights = node.input_values()
+        shape = list(value.get_shape())
+        if len(shape) != 3:
+            continue
+        batch, channels, length = shape
+        attrs = node.get_attributes()
+        if list(weights.get_shape()) != [channels, channels, 7] or attrs["dilations"] not in (
+            [3],
+            [9],
+        ):
+            continue
+        dilation = attrs["dilations"][0]
+        if (
+            attrs["strides"] != [1]
+            or attrs["pads_begin"] != [3 * dilation]
+            or attrs["pads_end"] != [3 * dilation]
+            or attrs["auto_pad"] != "explicit"
+        ):
+            continue
+
+        prefix = f"{node.get_friendly_name()}/phase_fold/"
+        padding = -length % dilation
+        if padding:
+            value = op.pad(
+                value,
+                op.constant([0, 0, 0], name=prefix + "pads_begin"),
+                op.constant([0, 0, padding], name=prefix + "pads_end"),
+                "constant",
+                op.constant(0, value.get_element_type(), name=prefix + "zero"),
+                name=prefix + "pad_tail",
+            )
+        # X[q,r] = x[q*d+r]: a 7x1 kernel along q is the same dilated 1D
+        # convolution, without the NPU's seven pointwise convolutions and sums.
+        packed_shape = [batch, channels, (length + padding) // dilation, dilation]
+        packed = op.reshape(
+            value,
+            op.constant(packed_shape, name=prefix + "packed_shape"),
+            False,
+            name=prefix + "pack",
+        )
+        weights = op.reshape(
+            weights,
+            op.constant([channels, channels, 7, 1], name=prefix + "weights_shape"),
+            False,
+            name=prefix + "weights",
+        )
+        conv = op.convolution(
+            packed,
+            weights,
+            strides=[1, 1],
+            pads_begin=[3, 0],
+            pads_end=[3, 0],
+            dilations=[1, 1],
+            name=prefix + "conv",
+        )
+        result = op.reshape(
+            conv,
+            op.constant([batch, channels, length + padding], name=prefix + "output_shape"),
+            False,
+            name=prefix + "unpack",
+        )
+        if padding:
+            result = op.slice(
+                result,
+                op.constant([0], name=prefix + "crop_start"),
+                op.constant([length], name=prefix + "crop_stop"),
+                op.constant([1], name=prefix + "crop_step"),
+                op.constant([2], name=prefix + "crop_axis"),
+                name=prefix + "crop_tail",
+            )
+        result.output(0).set_names(node.output(0).get_names())
+        node.output(0).replace(result.output(0))
+    model.validate_nodes_and_infer_types()
+
+
 def _codec_context_frames(model: Any, frame_size: int) -> int:
     # Follow the longest convolution path, including residual branches, in input units.
     fields: dict[Any, tuple[float, float, float]] = {model.input(0).get_node(): (1.0, 0.0, 0.0)}
@@ -1721,7 +1801,8 @@ class OpenVINODACVAEDecoderBackend(_OpenVINODACVAEBackend):
 
     def _compile(self, inputs: tuple[torch.Tensor, ...]):
         model = self._prepare_model(inputs)
-        strategy = _pack_dacvae_polynomials(self.ov, model) if self.device == "NPU" else {}
+        strategy = _pack_dacvae_polynomials(self.ov, model)
+        _fold_dacvae_dilated_convolutions(self.ov, model)
         if not strategy:
             return self.core.compile_model(model, self.device)
 
