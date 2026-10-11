@@ -55,6 +55,13 @@ xpu = [
     "torchcodec>=0.10.0,<0.11.0; sys_platform == 'linux' or sys_platform == 'win32'",
     "triton-xpu==3.6.0; sys_platform == 'linux' or sys_platform == 'win32'",
 ]
+npu = [
+    "openvino>=2026.4.0,<2027",
+    "torch>=2.10.0,<2.11.0",
+    "torchao>=0.16.0,<0.17.0",
+    "torchaudio>=2.10.0,<2.11.0",
+    "torchcodec>=0.10.0,<0.11.0",
+]
 dev = [
     "ruff>=0.9.0",
 ]
@@ -64,6 +71,7 @@ conflicts = [
     [
         { extra = "cpu" },
         { extra = "cu128" },
+        { extra = "npu" },
         { extra = "rocm" },
         { extra = "xpu" },
     ],
@@ -73,12 +81,14 @@ conflicts = [
 torch = [
     { index = "pytorch-cpu", extra = "cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
     { index = "pytorch-cu128", extra = "cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { index = "pytorch-cpu", extra = "npu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
     { index = "pytorch-rocm", extra = "rocm", marker = "sys_platform == 'linux'" },
     { index = "pytorch-xpu", extra = "xpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 torchaudio = [
     { index = "pytorch-cpu", extra = "cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
     { index = "pytorch-cu128", extra = "cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { index = "pytorch-cpu", extra = "npu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
     { index = "pytorch-rocm", extra = "rocm", marker = "sys_platform == 'linux'" },
     { index = "pytorch-xpu", extra = "xpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]

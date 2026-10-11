@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,6 +38,7 @@ def unpatchify_latent(patched: torch.Tensor, patch_size: int, latent_dim: int) -
 @dataclass
 class DACVAECodec:
     model: torch.nn.Module
+    checkpoint_path: Path
     sample_rate: int
     latent_dim: int
     device: torch.device
@@ -105,6 +107,7 @@ class DACVAECodec:
             z = model.encode(dummy)  # (B, D, T)
         return cls(
             model=model,
+            checkpoint_path=Path(location),
             sample_rate=int(model.sample_rate),
             latent_dim=int(z.shape[1]),
             device=torch.device(device),
@@ -181,12 +184,14 @@ class DACVAECodec:
         *,
         normalize_db: float | None | object = _CODEC_DEFAULT,
         ensure_max: bool | None = None,
+        encode_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """
         Input:
           waveform: (B, C, T) or (C, T)
           normalize_db: Optional target loudness (LUFS-like dB) applied before encode
           ensure_max: If True and normalize_db is None, scale down only when abs peak exceeds 1.0
+          encode_fn: Optional backend for encoding the preprocessed mono waveform
         Output:
           latent: (B, T_latent, D_latent)
         """
@@ -235,6 +240,8 @@ class DACVAECodec:
             waveform = torch.stack(processed, dim=0).unsqueeze(1)
 
         waveform = waveform.to(self.device, dtype=self.dtype)
+        if encode_fn is not None:
+            return encode_fn(waveform)
         if self.deterministic_encode:
             required_paths_present = (
                 hasattr(self.model, "encoder")

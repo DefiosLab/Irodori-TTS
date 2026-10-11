@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import asdict
 
 import torch
@@ -32,21 +33,34 @@ DURATION_ARCHITECTURES = {
     "token_sum_adarn_zero_no_aux",
     "token_sum_dual_adarn_zero_no_aux",
 }
+EncodedConditionTensors = tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
     t = torch.arange(end, dtype=torch.float32)
     freqs = torch.outer(t, freqs)
-    return torch.complex(torch.cos(freqs), torch.sin(freqs))
+    return torch.stack((torch.cos(freqs), torch.sin(freqs)), dim=-1)
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     # x: (B, S, H, Dh), Dh must be even.
-    x_ = torch.view_as_complex(x.float().reshape(*x.shape[:3], -1, 2))
-    x_ = x_ * freqs_cis[None, :, None, :]
-    x_ = torch.view_as_real(x_).reshape_as(x)
-    return x_.type_as(x)
+    x_pairs = x.float().reshape(*x.shape[:3], -1, 2)
+    x_real, x_imag = x_pairs.unbind(dim=-1)
+    cos = freqs_cis[None, :, None, :, 0]
+    sin = freqs_cis[None, :, None, :, 1]
+    rotated = torch.stack(
+        (x_real * cos - x_imag * sin, x_real * sin + x_imag * cos),
+        dim=-1,
+    )
+    return rotated.reshape_as(x).type_as(x)
 
 
 def get_timestep_embedding(timestep: torch.Tensor, dim: int) -> torch.Tensor:
@@ -647,9 +661,7 @@ class TextEncoder(nn.Module):
             for _ in range(layers)
         )
         self.head_dim = dim // heads
-        self.register_buffer(
-            "_freqs_cis_cache", torch.empty(0, 0, dtype=torch.complex64), persistent=False
-        )
+        self.register_buffer("_freqs_cis_cache", torch.empty(0, 0, 2), persistent=False)
 
     def _rope_freqs(self, seq_len: int, device: torch.device) -> torch.Tensor:
         cache = self._freqs_cis_cache
@@ -854,7 +866,7 @@ class PretrainedConditionProjector(nn.Module):
 
     def forward(
         self,
-        backbone: PretrainedTextBackbone,
+        backbone: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         input_ids: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
@@ -900,9 +912,7 @@ class ReferenceLatentEncoder(nn.Module):
             for _ in range(cfg.speaker_layers)
         )
         self.head_dim = cfg.speaker_dim // cfg.speaker_heads
-        self.register_buffer(
-            "_freqs_cis_cache", torch.empty(0, 0, dtype=torch.complex64), persistent=False
-        )
+        self.register_buffer("_freqs_cis_cache", torch.empty(0, 0, 2), persistent=False)
 
     def _rope_freqs(self, seq_len: int, device: torch.device) -> torch.Tensor:
         cache = self._freqs_cis_cache
@@ -1589,9 +1599,7 @@ class TextToLatentRFDiT(nn.Module):
         self.head_dim = cfg.model_dim // cfg.num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("model head_dim must be even for RoPE")
-        self.register_buffer(
-            "_freqs_cis_cache", torch.empty(0, 0, dtype=torch.complex64), persistent=False
-        )
+        self.register_buffer("_freqs_cis_cache", torch.empty(0, 0, 2), persistent=False)
 
     def _add_meanflow_delta_condition(self) -> None:
         if self.delta_cond_module is not None:
@@ -1779,14 +1787,9 @@ class TextToLatentRFDiT(nn.Module):
         text_condition_dropout: torch.Tensor | None = None,
         speaker_condition_dropout: torch.Tensor | None = None,
         caption_condition_dropout: torch.Tensor | None = None,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-    ]:
+        pretrained_backbone_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+        | None = None,
+    ) -> EncodedConditionTensors:
         if text_condition_dropout is not None:
             text_mask = text_mask.clone()
             text_mask[text_condition_dropout] = False
@@ -1822,10 +1825,18 @@ class TextToLatentRFDiT(nn.Module):
                 caption_mask = caption_mask.clone()
                 caption_mask[caption_condition_dropout] = False
 
-        if self.pretrained_text_backbone is None:
+        pretrained_backbone = self.pretrained_text_backbone
+        if pretrained_backbone_fn is not None:
+            if pretrained_backbone is None:
+                raise ValueError(
+                    "pretrained_backbone_fn requires text_encoder_type='pretrained'."
+                )
+            pretrained_backbone = pretrained_backbone_fn
+
+        if pretrained_backbone is None:
             text_state = self.text_encoder(text_input_ids, text_mask)
         else:
-            text_state = self.text_encoder(self.pretrained_text_backbone, text_input_ids, text_mask)
+            text_state = self.text_encoder(pretrained_backbone, text_input_ids, text_mask)
         text_state = self.text_norm(text_state)
         ref_state = None
         if self.cfg.use_speaker_condition_resolved:
@@ -1865,11 +1876,11 @@ class TextToLatentRFDiT(nn.Module):
             )
         caption_state = None
         if self.cfg.use_caption_condition:
-            if self.pretrained_text_backbone is None:
+            if pretrained_backbone is None:
                 caption_state = self.caption_encoder(caption_input_ids, caption_mask)
             else:
                 caption_state = self.caption_encoder(
-                    self.pretrained_text_backbone, caption_input_ids, caption_mask
+                    pretrained_backbone, caption_input_ids, caption_mask
                 )
             caption_state = self.caption_norm(caption_state)
         return text_state, text_mask, ref_state, ref_mask, caption_state, caption_mask
@@ -1998,15 +2009,7 @@ class TextToLatentRFDiT(nn.Module):
         duration_only: bool = False,
         duration_backprop_to_condition: bool = False,
         delta_t: torch.Tensor | None = None,
-        encoded_conditions: tuple[
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor | None,
-            torch.Tensor | None,
-            torch.Tensor | None,
-            torch.Tensor | None,
-        ]
-        | None = None,
+        encoded_conditions: EncodedConditionTensors | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if duration_features is not None and encoded_conditions is not None:
             raise ValueError("encoded_conditions is not supported by the duration path.")

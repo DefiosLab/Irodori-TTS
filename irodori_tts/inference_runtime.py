@@ -7,11 +7,12 @@ import math
 import secrets
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torchaudio
@@ -37,6 +38,16 @@ from .speaker_inversion import (
 from .text_normalization import normalize_text
 from .tokenizer import PretrainedTextTokenizer
 from .watermark import SilentCipherWatermarker
+
+if TYPE_CHECKING:
+    from .openvino_backend import OpenVINODiTBackend
+
+PretrainedBackboneFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+CodecEncodeFn = Callable[[torch.Tensor], torch.Tensor]
+CodecDecodeFn = Callable[[torch.Tensor], torch.Tensor]
+_MIN_CONDITION_BUCKET_LENGTH = 8
+_MAX_CACHED_REFERENCE_LATENTS = 16
+_MAX_REFERENCE_LATENT_CACHE_BYTES = 32 * 1024 * 1024
 
 
 def _is_mps_available() -> bool:
@@ -78,6 +89,16 @@ def resolve_runtime_device(device: str | torch.device) -> torch.device:
     )
 
 
+def _is_npu_device(device: str | torch.device) -> bool:
+    return str(device).strip().lower() == "npu"
+
+
+def _resolve_torch_device(device: str | torch.device) -> torch.device:
+    if _is_npu_device(device):
+        return torch.device("cpu")
+    return resolve_runtime_device(device)
+
+
 def list_available_runtime_devices() -> list[str]:
     devices: list[str] = []
     if torch.cuda.is_available():
@@ -95,10 +116,36 @@ def default_runtime_device() -> str:
 
 
 def list_available_runtime_precisions(device: str | torch.device) -> list[str]:
+    if _is_npu_device(device):
+        return ["fp32"]
     resolved = resolve_runtime_device(device)
     if resolved.type in ("cuda", "xpu"):
         return ["fp32", "bf16"]
     return ["fp32"]
+
+
+def _bucket_condition_inputs(
+    input_ids: torch.Tensor,
+    mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if input_ids.ndim != 2 or mask.ndim != 2 or input_ids.shape != mask.shape:
+        raise ValueError(
+            "Condition inputs must have matching (B,S) shapes: "
+            f"input_ids={tuple(input_ids.shape)} mask={tuple(mask.shape)}"
+        )
+    if input_ids.shape[1] == 0:
+        raise ValueError("Condition inputs must contain at least one token position.")
+
+    max_valid_length = int(mask.sum(dim=1).max().item())
+    if max_valid_length == 0:
+        bucket_length = 1
+    else:
+        bucket_length = max(
+            _MIN_CONDITION_BUCKET_LENGTH,
+            1 << (max_valid_length - 1).bit_length(),
+        )
+        bucket_length = min(bucket_length, input_ids.shape[1])
+    return input_ids[:, :bucket_length], mask[:, :bucket_length]
 
 
 def _sync_device(device: torch.device) -> None:
@@ -196,6 +243,73 @@ class RuntimeKey:
     codec_deterministic_decode: bool = True
     compile_model: bool = False
     compile_dynamic: bool = False
+
+
+def _create_dit_forward_fn(
+    *,
+    model: TextToLatentRFDiT,
+    model_device: str | torch.device,
+    checkpoint_path: str | Path,
+) -> OpenVINODiTBackend | None:
+    if not _is_npu_device(model_device):
+        return None
+    from .openvino_backend import create_dit_backend
+
+    return create_dit_backend(
+        model,
+        device="NPU",
+        checkpoint_path=checkpoint_path,
+    )
+
+
+def _create_pretrained_backbone_fn(
+    *,
+    model: TextToLatentRFDiT,
+    model_device: str | torch.device,
+    checkpoint_path: str | Path,
+) -> PretrainedBackboneFn | None:
+    if not _is_npu_device(model_device) or model.pretrained_text_backbone is None:
+        return None
+    from .openvino_backend import create_pretrained_text_backbone_backend
+
+    return create_pretrained_text_backbone_backend(
+        model,
+        device="NPU",
+        checkpoint_path=checkpoint_path,
+    )
+
+
+def _create_codec_encode_fn(
+    *,
+    codec: DACVAECodec,
+    codec_device: str | torch.device,
+) -> CodecEncodeFn | None:
+    if not _is_npu_device(codec_device):
+        return None
+    from .openvino_backend import create_dacvae_encoder_backend
+
+    return create_dacvae_encoder_backend(
+        codec.model,
+        device="NPU",
+        checkpoint_path=codec.checkpoint_path,
+        deterministic_encode=codec.deterministic_encode,
+    )
+
+
+def _create_codec_decode_fn(
+    *,
+    codec: DACVAECodec,
+    codec_device: str | torch.device,
+) -> CodecDecodeFn | None:
+    if not _is_npu_device(codec_device):
+        return None
+    from .openvino_backend import create_dacvae_decoder_backend
+
+    return create_dacvae_decoder_backend(
+        codec.model,
+        device="NPU",
+        checkpoint_path=codec.checkpoint_path,
+    )
 
 
 @dataclass
@@ -603,28 +717,50 @@ class InferenceRuntime:
         default_text_max_len: int,
         default_caption_max_len: int,
         default_max_ref_seconds: float = _LEGACY_MAX_REF_SECONDS,
+        dit_forward_fn: Callable[..., torch.Tensor] | None = None,
+        context_kv_cache_fn: Callable[..., list[tuple[torch.Tensor, ...]]] | None = None,
+        pretrained_backbone_fn: PretrainedBackboneFn | None = None,
+        codec_encode_fn: CodecEncodeFn | None = None,
+        codec_decode_fn: CodecDecodeFn | None = None,
     ) -> None:
         self.key = key
-        self.model_device = resolve_runtime_device(key.model_device)
-        self.codec_device = resolve_runtime_device(key.codec_device)
+        self.model_device = _resolve_torch_device(key.model_device)
+        self.codec_device = _resolve_torch_device(key.codec_device)
+        if _is_npu_device(key.model_device) and dit_forward_fn is None:
+            raise ValueError("model_device='npu' requires an OpenVINO DiT backend.")
+        if _is_npu_device(key.codec_device) and codec_decode_fn is None:
+            raise ValueError("codec_device='npu' requires an OpenVINO DACVAE decoder backend.")
+        if _is_npu_device(key.codec_device) and codec_encode_fn is None:
+            raise ValueError("codec_device='npu' requires an OpenVINO DACVAE encoder backend.")
         self.model_cfg = model_cfg
         self.train_cfg = train_cfg
         self.model = model
+        self.dit_forward_fn = dit_forward_fn
+        self.context_kv_cache_fn = context_kv_cache_fn
+        self.pretrained_backbone_fn = pretrained_backbone_fn
+        self.codec_encode_fn = codec_encode_fn
+        self.codec_decode_fn = codec_decode_fn
         self.tokenizer = tokenizer
         self.caption_tokenizer = caption_tokenizer
         self.codec = codec
         self.default_text_max_len = default_text_max_len
         self.default_caption_max_len = default_caption_max_len
         self.default_max_ref_seconds = float(default_max_ref_seconds)
-        self.watermarker = SilentCipherWatermarker(device=str(self.codec_device))
+        self.watermarker = SilentCipherWatermarker(device=key.codec_device)
         self._infer_lock = threading.Lock()
         self._model_dtype = next(self.model.parameters()).dtype
         self._lora_adapter_names: dict[str, str] = {}
+        self._reference_latent_cache: OrderedDict[tuple, tuple[torch.Tensor, tuple[str, ...]]] = (
+            OrderedDict()
+        )
 
     @classmethod
     def from_key(cls, key: RuntimeKey) -> InferenceRuntime:
-        model_device = resolve_runtime_device(key.model_device)
-        codec_device = resolve_runtime_device(key.codec_device)
+        npu_model = _is_npu_device(key.model_device)
+        if npu_model and key.compile_model:
+            raise ValueError("model_device='npu' cannot be combined with compile_model.")
+        model_device = _resolve_torch_device(key.model_device)
+        codec_device = _resolve_torch_device(key.codec_device)
         model_dtype = resolve_runtime_dtype(
             precision=key.model_precision,
             device=model_device,
@@ -643,7 +779,6 @@ class InferenceRuntime:
             model_cfg_dict,
             section="checkpoint model_config",
         )
-
         model = TextToLatentRFDiT(
             model_cfg,
             pretrained_backbone_config=text_encoder_config,
@@ -661,6 +796,16 @@ class InferenceRuntime:
             model,
             enabled=bool(key.compile_model),
             dynamic=bool(key.compile_dynamic),
+        )
+        dit_backend = _create_dit_forward_fn(
+            model=model,
+            model_device=key.model_device,
+            checkpoint_path=checkpoint_path,
+        )
+        pretrained_backbone_fn = _create_pretrained_backbone_fn(
+            model=model,
+            model_device=key.model_device,
+            checkpoint_path=checkpoint_path,
         )
 
         text_tokenizer_source, text_tokenizer_is_local = _resolve_tokenizer_source(
@@ -727,6 +872,14 @@ class InferenceRuntime:
                 f"Latent dimension mismatch: checkpoint latent_dim={model_cfg.latent_dim} but codec latent_dim={codec.latent_dim}. "
                 "Use a compatible codec/checkpoint pair."
             )
+        codec_encode_fn = _create_codec_encode_fn(
+            codec=codec,
+            codec_device=key.codec_device,
+        )
+        codec_decode_fn = _create_codec_decode_fn(
+            codec=codec,
+            codec_device=key.codec_device,
+        )
 
         return cls(
             key=key,
@@ -739,7 +892,65 @@ class InferenceRuntime:
             default_text_max_len=default_text_max_len,
             default_caption_max_len=default_caption_max_len,
             default_max_ref_seconds=default_max_ref_seconds,
+            dit_forward_fn=dit_backend,
+            context_kv_cache_fn=(
+                dit_backend.build_context_kv_cache if dit_backend is not None else None
+            ),
+            pretrained_backbone_fn=pretrained_backbone_fn,
+            codec_encode_fn=codec_encode_fn,
+            codec_decode_fn=codec_decode_fn,
         )
+
+    def _prepare_openvino_backends(self) -> None:
+        npu_model = _is_npu_device(self.key.model_device)
+        npu_codec = _is_npu_device(self.key.codec_device)
+        if not (npu_model or npu_codec):
+            return
+
+        started = time.perf_counter()
+        print("[openvino] preparing NPU inference profiles...", flush=True)
+        if npu_model:
+            from .openvino_backend import _CONDITION_SEQUENCE_PROFILES
+
+            # Include checkpoint defaults as well as all standard inference profiles.
+            max_text, max_speaker, max_caption = _CONDITION_SEQUENCE_PROFILES[-1]
+            frames_per_second = self.codec.sample_rate / self.codec.model.hop_length
+            speaker_length = 0
+            if self.model_cfg.use_speaker_condition_resolved:
+                reference_frames = math.ceil(self.default_max_ref_seconds * frames_per_second)
+                speaker_length = (
+                    reference_frames
+                    // self.model_cfg.latent_patch_size
+                    // self.model_cfg.speaker_patch_size
+                    + 1  # The reference encoder prepends a summary token.
+                )
+            text_length = max(max_text, self.default_text_max_len)
+            caption_length = (
+                max(max_caption, self.default_caption_max_len)
+                if self.model_cfg.use_caption_condition
+                else 0
+            )
+            self.dit_forward_fn.prepare_eager_profiles(
+                max_sequence_length=math.ceil(
+                    SamplingRequest.max_seconds
+                    * frames_per_second
+                    / self.model_cfg.latent_patch_size
+                ),
+                max_condition_lengths=(
+                    text_length,
+                    max(max_speaker, speaker_length),
+                    caption_length,
+                ),
+            )
+            if self.pretrained_backbone_fn is not None:
+                self.pretrained_backbone_fn.prepare_eager_profiles(
+                    max_sequence_lengths=(text_length, max(1, caption_length)),
+                )
+        if npu_codec:
+            self.codec_encode_fn.prepare_eager_profiles()
+            self.codec_decode_fn.prepare_eager_profiles()
+            self.watermarker.prepare_eager_profiles()
+        print(f"[openvino] NPU ready ({time.perf_counter() - started:.2f}s).", flush=True)
 
     def _resolve_lora_adapter_path(self, adapter_path: str | None) -> str | None:
         if adapter_path is None:
@@ -803,6 +1014,11 @@ class InferenceRuntime:
 
         if self.key.compile_model:
             raise RuntimeError("Dynamic LoRA loading is not compatible with compile_model=True.")
+        if _is_npu_device(self.key.model_device):
+            raise RuntimeError(
+                "Dynamic LoRA loading is not compatible with model_device='npu'. "
+                "Use a checkpoint with the adapter merged before NPU preparation."
+            )
 
         adapter_name = self._lora_adapter_names.get(resolved_path)
         if adapter_name is None:
@@ -830,6 +1046,77 @@ class InferenceRuntime:
         )
         self.model.eval()
         return nullcontext()
+
+    def _encode_reference_waveform(
+        self,
+        *,
+        path: str,
+        req: SamplingRequest,
+        max_ref_seconds: float | None,
+        messages: list[str],
+    ) -> torch.Tensor:
+        cache_key = None
+        if self.codec.deterministic_encode:
+            source = Path(path).resolve()
+            stat = source.stat()
+            cache_key = (
+                source,
+                stat.st_dev,
+                stat.st_ino,
+                stat.st_size,
+                stat.st_mtime_ns,
+                stat.st_ctime_ns,
+                max_ref_seconds,
+                req.ref_normalize_db,
+                bool(req.ref_ensure_max),
+            )
+            cached = self._reference_latent_cache.get(cache_key)
+            if cached is not None:
+                self._reference_latent_cache.move_to_end(cache_key)
+                latent, cached_messages = cached
+                messages.extend(cached_messages)
+                return latent
+
+        clip_messages = []
+        wav, sr = _load_audio(path)
+        if max_ref_seconds is not None:
+            max_ref_samples = max(1, int(max_ref_seconds * float(sr)))
+            if wav.shape[1] > max_ref_samples:
+                clip_messages.append(
+                    f"warning: reference audio exceeds max_ref_seconds ({max_ref_seconds}s). "
+                    f"Trimming from {float(wav.shape[1]) / float(sr):.2f}s to {float(max_ref_samples) / float(sr):.2f}s."
+                )
+                wav = wav[:, :max_ref_samples]
+        latent = (
+            self.codec.encode_waveform(
+                wav.unsqueeze(0),
+                sample_rate=int(sr),
+                normalize_db=req.ref_normalize_db,
+                ensure_max=bool(req.ref_ensure_max),
+                encode_fn=self.codec_encode_fn,
+            )
+            .detach()
+            .cpu()
+        )
+        if latent.shape[1] == 0:
+            raise ValueError(f"Reference waveform produced an empty latent: {path}")
+        messages.extend(clip_messages)
+
+        if (
+            cache_key is not None
+            and latent.numel() * latent.element_size() <= _MAX_REFERENCE_LATENT_CACHE_BYTES
+        ):
+            self._reference_latent_cache[cache_key] = (latent, tuple(clip_messages))
+            while (
+                len(self._reference_latent_cache) > _MAX_CACHED_REFERENCE_LATENTS
+                or sum(
+                    value.numel() * value.element_size()
+                    for value, _ in self._reference_latent_cache.values()
+                )
+                > _MAX_REFERENCE_LATENT_CACHE_BYTES
+            ):
+                self._reference_latent_cache.popitem(last=False)
+        return latent
 
     def _load_reference_latent(
         self,
@@ -926,23 +1213,14 @@ class InferenceRuntime:
                 )
             latent_pieces = []
             for path in wav_paths:
-                wav, sr = _load_audio(path)
-                if len(wav_paths) == 1 and max_ref_seconds > 0:
-                    max_ref_samples = max(1, int(max_ref_seconds * float(sr)))
-                    if wav.shape[1] > max_ref_samples:
-                        messages.append(
-                            f"warning: reference audio exceeds max_ref_seconds ({max_ref_seconds}s). "
-                            f"Trimming from {float(wav.shape[1]) / float(sr):.2f}s to {float(max_ref_samples) / float(sr):.2f}s."
-                        )
-                        wav = wav[:, :max_ref_samples]
-                piece = self.codec.encode_waveform(
-                    wav.unsqueeze(0),
-                    sample_rate=int(sr),
-                    normalize_db=req.ref_normalize_db,
-                    ensure_max=bool(req.ref_ensure_max),
-                ).cpu()
-                if piece.shape[1] == 0:
-                    raise ValueError(f"Reference waveform produced an empty latent: {path}")
+                piece = self._encode_reference_waveform(
+                    path=path,
+                    req=req,
+                    max_ref_seconds=max_ref_seconds
+                    if len(wav_paths) == 1 and max_ref_seconds > 0
+                    else None,
+                    messages=messages,
+                )
                 latent_pieces.append(piece)
                 if (
                     max_ref_latent_steps is not None
@@ -1077,6 +1355,7 @@ class InferenceRuntime:
         num_candidates = int(req.num_candidates)
         if num_candidates <= 0:
             raise ValueError(f"num_candidates must be > 0, got {num_candidates}")
+        condition_batch_size = 1 if _is_npu_device(self.key.model_device) else num_candidates
         decode_mode = str(req.decode_mode).strip().lower()
         if decode_mode not in {"sequential", "batch"}:
             raise ValueError(
@@ -1203,9 +1482,10 @@ class InferenceRuntime:
         ):
             t0 = _measure_start(self.model_device)
             text_ids, text_mask = self.tokenizer.batch_encode(
-                [normalized_text] * num_candidates,
+                [normalized_text] * condition_batch_size,
                 max_length=text_max_len,
             )
+            text_ids, text_mask = _bucket_condition_inputs(text_ids, text_mask)
             stage_sec = _measure_end(self.model_device, t0)
             stage_timings.append(("tokenize_text", stage_sec))
             _log(f"[runtime] tokenize_text: {stage_sec * 1000.0:.1f} ms")
@@ -1220,11 +1500,15 @@ class InferenceRuntime:
                     )
                 caption_text = "" if req.caption is None else str(req.caption).strip()
                 caption_ids, caption_mask = self.caption_tokenizer.batch_encode(
-                    [caption_text] * num_candidates,
+                    [caption_text] * condition_batch_size,
                     max_length=caption_max_len,
                 )
                 if caption_text == "":
                     caption_mask.zero_()
+                caption_ids, caption_mask = _bucket_condition_inputs(
+                    caption_ids,
+                    caption_mask,
+                )
                 caption_ids = caption_ids.to(self.model_device)
                 caption_mask = caption_mask.to(self.model_device)
 
@@ -1235,13 +1519,13 @@ class InferenceRuntime:
                 speaker_mask_override,
             ) = self._load_speaker_embedding_condition(
                 req=req,
-                batch_size=num_candidates,
+                batch_size=condition_batch_size,
                 messages=messages,
             )
             if speaker_state_override is None:
                 ref_latent, ref_mask = self._load_reference_latent(
                     req=req,
-                    batch_size=num_candidates,
+                    batch_size=condition_batch_size,
                     messages=messages,
                 )
             else:
@@ -1251,6 +1535,23 @@ class InferenceRuntime:
             for msg in messages[msg_count_before_ref:]:
                 _log(msg)
             _log(f"[runtime] prepare_reference: {stage_sec * 1000.0:.1f} ms")
+
+            t0 = _measure_start(self.model_device)
+            encoded_conditions = self.model.encode_conditions(
+                text_input_ids=text_ids,
+                text_mask=text_mask,
+                ref_latent=ref_latent,
+                ref_mask=ref_mask,
+                caption_input_ids=caption_ids,
+                caption_mask=caption_mask,
+                speaker_state_override=speaker_state_override,
+                speaker_mask_override=speaker_mask_override,
+                speaker_uncond_mode=req.speaker_uncond_mode,
+                pretrained_backbone_fn=self.pretrained_backbone_fn,
+            )
+            stage_sec = _measure_end(self.model_device, t0)
+            stage_timings.append(("encode_conditions", stage_sec))
+            _log(f"[runtime] encode_conditions: {stage_sec * 1000.0:.1f} ms")
 
             hop_length = int(self.codec.model.hop_length)
             if manual_seconds is not None:
@@ -1270,14 +1571,14 @@ class InferenceRuntime:
             elif self.model_cfg.use_duration_predictor:
                 t0 = _measure_start(self.model_device)
                 has_speaker_duration = torch.zeros(
-                    (num_candidates,), dtype=torch.bool, device=self.model_device
+                    (condition_batch_size,), dtype=torch.bool, device=self.model_device
                 )
                 if speaker_mask_override is not None:
                     has_speaker_duration = speaker_mask_override.any(dim=1)
                 elif self.model_cfg.use_speaker_condition_resolved and ref_mask is not None:
                     has_speaker_duration = ref_mask.any(dim=1)
                 duration_features = build_duration_features(
-                    [normalized_text] * num_candidates,
+                    [normalized_text] * condition_batch_size,
                     token_counts=text_mask.sum(dim=1),
                     max_text_len=text_max_len,
                     has_speaker=has_speaker_duration,
@@ -1289,17 +1590,7 @@ class InferenceRuntime:
                     _duration_speaker_mask,
                     _duration_caption_state,
                     _duration_caption_mask,
-                ) = self.model.encode_conditions(
-                    text_input_ids=text_ids,
-                    text_mask=text_mask,
-                    ref_latent=ref_latent,
-                    ref_mask=ref_mask,
-                    caption_input_ids=caption_ids,
-                    caption_mask=caption_mask,
-                    speaker_state_override=speaker_state_override,
-                    speaker_mask_override=speaker_mask_override,
-                    speaker_uncond_mode=req.speaker_uncond_mode,
-                )
+                ) = encoded_conditions
                 pred_log_frames = self.model.predict_duration_log_frames(
                     text_state=duration_text_state,
                     text_mask=duration_text_mask,
@@ -1310,7 +1601,7 @@ class InferenceRuntime:
                     duration_features=duration_features,
                     has_speaker=has_speaker_duration,
                     has_caption=torch.full(
-                        (num_candidates,),
+                        (condition_batch_size,),
                         has_caption_text,
                         dtype=torch.bool,
                         device=self.model_device,
@@ -1355,6 +1646,13 @@ class InferenceRuntime:
                     _log(msg)
 
             t0 = _measure_start(self.model_device)
+            if condition_batch_size != num_candidates:
+                text_ids = text_ids.expand(num_candidates, -1)
+                text_mask = text_mask.expand(num_candidates, -1)
+                encoded_conditions = tuple(
+                    state.expand(num_candidates, *state.shape[1:]) if state is not None else None
+                    for state in encoded_conditions
+                )
             if self.model_cfg.flow_parameterization == "meanflow":
                 z_patched = sample_euler_meanflow(
                     model=self.model,
@@ -1370,6 +1668,10 @@ class InferenceRuntime:
                     speaker_uncond_mode=req.speaker_uncond_mode,
                     num_steps=num_steps,
                     seed=used_seed,
+                    use_context_kv_cache=bool(req.context_kv_cache),
+                    velocity_fn=self.dit_forward_fn,
+                    encoded_conditions=encoded_conditions,
+                    context_kv_cache_fn=self.context_kv_cache_fn,
                 )
             else:
                 z_patched = sample_euler_rf_cfg(
@@ -1401,6 +1703,9 @@ class InferenceRuntime:
                     speaker_kv_min_t=speaker_kv_min_t,
                     t_schedule_mode=str(req.t_schedule_mode),
                     sway_coeff=float(req.sway_coeff),
+                    velocity_fn=self.dit_forward_fn,
+                    encoded_conditions=encoded_conditions,
+                    context_kv_cache_fn=self.context_kv_cache_fn,
                 )
             stage_sec = _measure_end(self.model_device, t0)
             sample_stage = (
@@ -1423,9 +1728,10 @@ class InferenceRuntime:
             z = z[:, :latent_steps]
 
             t0 = _measure_start(self.model_device, self.codec_device)
+            decode_latent = self.codec_decode_fn or self.codec.decode_latent
             trimmed_audios: list[torch.Tensor] = []
             if decode_mode == "batch":
-                audio_batch = self.codec.decode_latent(z).cpu()
+                audio_batch = decode_latent(z).cpu()
                 for i in range(num_candidates):
                     audio_i = audio_batch[i]
                     max_samples = target_samples
@@ -1444,7 +1750,7 @@ class InferenceRuntime:
                     trimmed_audios.append(audio_i[:, :max_samples])
             else:
                 for i in range(num_candidates):
-                    audio_i = self.codec.decode_latent(z[i : i + 1]).cpu()[0]
+                    audio_i = decode_latent(z[i : i + 1]).cpu()[0]
                     max_samples = target_samples
                     if bool(req.trim_tail):
                         flattening_point = find_flattening_point(
@@ -1495,9 +1801,16 @@ class InferenceRuntime:
         )
 
     def unload(self) -> None:
+        self._reference_latent_cache.clear()
+        self.dit_forward_fn = None
+        self.context_kv_cache_fn = None
+        self.pretrained_backbone_fn = None
+        self.codec_encode_fn = None
+        self.codec_decode_fn = None
         del self.model
         del self.tokenizer
         del self.codec
+        del self.watermarker
         gc.collect()
         for device in (self.model_device, self.codec_device):
             if device.type == "cuda":
@@ -1512,6 +1825,34 @@ class InferenceRuntime:
                     xpu.empty_cache()
 
 
+def acquire_runtime(key: RuntimeKey) -> InferenceRuntime:
+    """Acquire a local or Hugging Face checkpoint and complete NPU preparation."""
+    source = str(key.checkpoint).strip()
+    if not source:
+        raise ValueError("checkpoint is required.")
+    local_path = Path(source).expanduser()
+    if local_path.is_file() or local_path.suffix.lower() in {".pt", ".safetensors"}:
+        if not local_path.is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {local_path}")
+        checkpoint_path = str(local_path)
+        print(f"[checkpoint] using local file: {checkpoint_path}", flush=True)
+    else:
+        checkpoint_path = download_hf_checkpoint(source)
+        print(
+            f"[checkpoint] downloaded model.safetensors from hf://{source} -> {checkpoint_path}",
+            flush=True,
+        )
+
+    runtime = InferenceRuntime.from_key(replace(key, checkpoint=checkpoint_path))
+    try:
+        runtime._prepare_openvino_backends()
+    except Exception:
+        runtime.unload()
+        raise
+    print(f"[checkpoint] model ready: {checkpoint_path}", flush=True)
+    return runtime
+
+
 _RUNTIME_CACHE_LOCK = threading.Lock()
 _RUNTIME_CACHE_KEY: RuntimeKey | None = None
 _RUNTIME_CACHE_VALUE: InferenceRuntime | None = None
@@ -1524,7 +1865,7 @@ def get_cached_runtime(key: RuntimeKey) -> tuple[InferenceRuntime, bool]:
             return _RUNTIME_CACHE_VALUE, False
 
         old_runtime = _RUNTIME_CACHE_VALUE
-        runtime = InferenceRuntime.from_key(key)
+        runtime = acquire_runtime(key)
         _RUNTIME_CACHE_KEY = key
         _RUNTIME_CACHE_VALUE = runtime
 

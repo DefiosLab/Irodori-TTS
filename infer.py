@@ -6,11 +6,10 @@ import math
 from pathlib import Path
 
 from irodori_tts.inference_runtime import (
-    InferenceRuntime,
     RuntimeKey,
     SamplingRequest,
+    acquire_runtime,
     default_runtime_device,
-    download_hf_checkpoint,
     resolve_cfg_scales,
     save_wav,
 )
@@ -36,26 +35,6 @@ def _print_timings(timings: list[tuple[str, float]], total_to_decode: float) -> 
     for name, sec in timings:
         print(f"[timing] {name}: {sec * 1000.0:.1f} ms")
     print(f"[timing] total_to_decode: {total_to_decode:.3f} s")
-
-
-def _resolve_checkpoint_path(args: argparse.Namespace) -> str:
-    if args.checkpoint is not None:
-        checkpoint_path = Path(str(args.checkpoint)).expanduser()
-        if not checkpoint_path.is_file():
-            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-        print(f"[checkpoint] using local file: {checkpoint_path}", flush=True)
-        return str(checkpoint_path)
-
-    repo_id = str(args.hf_checkpoint).strip()
-    if repo_id == "":
-        raise ValueError("hf_checkpoint must be non-empty.")
-
-    checkpoint_path = download_hf_checkpoint(repo_id)
-    print(
-        f"[checkpoint] downloaded model.safetensors from hf://{repo_id} -> {checkpoint_path}",
-        flush=True,
-    )
-    return str(checkpoint_path)
 
 
 def main() -> None:
@@ -92,7 +71,7 @@ def main() -> None:
     parser.add_argument(
         "--model-device",
         default=default_runtime_device(),
-        help="Model inference device (e.g. cuda, mps, cpu).",
+        help="Model inference target (e.g. cuda, xpu, mps, cpu, or experimental npu).",
     )
     parser.add_argument(
         "--model-precision",
@@ -103,7 +82,10 @@ def main() -> None:
     parser.add_argument(
         "--codec-device",
         default=default_runtime_device(),
-        help="Codec device for reference encode/decode (e.g. cuda, mps, cpu).",
+        help=(
+            "Codec target (e.g. cuda, xpu, mps, cpu, or experimental npu; "
+            "npu currently applies to decode only)."
+        ),
     )
     parser.add_argument(
         "--codec-precision",
@@ -397,11 +379,16 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    checkpoint_path = _resolve_checkpoint_path(args)
+    checkpoint_source = args.hf_checkpoint
+    if args.checkpoint is not None:
+        checkpoint_path = Path(str(args.checkpoint)).expanduser()
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        checkpoint_source = str(checkpoint_path)
 
-    runtime = InferenceRuntime.from_key(
+    runtime = acquire_runtime(
         RuntimeKey(
-            checkpoint=checkpoint_path,
+            checkpoint=str(checkpoint_source),
             model_device=str(args.model_device),
             codec_repo=str(args.codec_repo),
             model_precision=str(args.model_precision),

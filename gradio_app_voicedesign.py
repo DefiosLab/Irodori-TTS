@@ -13,7 +13,6 @@ from irodori_tts.inference_runtime import (
     SamplingRequest,
     clear_cached_runtime,
     default_runtime_device,
-    download_hf_checkpoint,
     get_cached_runtime,
     list_available_runtime_devices,
     list_available_runtime_precisions,
@@ -143,22 +142,6 @@ def _resolve_ref_wavs(uploaded_audio: object) -> list[str]:
     return [path for path in paths if path is not None]
 
 
-def _resolve_checkpoint_path(raw_checkpoint: str) -> str:
-    checkpoint = str(raw_checkpoint).strip()
-    if checkpoint == "":
-        raise ValueError("checkpoint is required.")
-    if is_speaker_inversion_safetensors_path(checkpoint):
-        raise ValueError("Speaker embedding files cannot be used as model checkpoints.")
-
-    suffix = Path(checkpoint).suffix.lower()
-    if suffix in {".pt", ".safetensors"}:
-        return checkpoint
-
-    resolved = download_hf_checkpoint(checkpoint)
-    print(f"[gradio-caption] checkpoint: hf://{checkpoint} -> {resolved}", flush=True)
-    return str(resolved)
-
-
 def _build_runtime_key(
     checkpoint: str,
     model_device: str,
@@ -166,9 +149,11 @@ def _build_runtime_key(
     codec_device: str,
     codec_precision: str,
 ) -> RuntimeKey:
-    checkpoint_path = _resolve_checkpoint_path(checkpoint)
+    checkpoint = str(checkpoint).strip()
+    if is_speaker_inversion_safetensors_path(checkpoint):
+        raise ValueError("Speaker embedding files cannot be used as model checkpoints.")
     return RuntimeKey(
-        checkpoint=checkpoint_path,
+        checkpoint=checkpoint,
         model_device=str(model_device),
         codec_repo="Aratako/Semantic-DACVAE-Japanese-32dim",
         model_precision=str(model_precision),
@@ -210,7 +195,7 @@ def _describe_runtime(
     status_text = "\n".join(
         [
             status,
-            f"checkpoint: {runtime_key.checkpoint}",
+            f"checkpoint: {runtime.key.checkpoint}",
             f"model_device: {runtime_key.model_device}",
             f"model_precision: {runtime_key.model_precision}",
             f"codec_device: {runtime_key.codec_device}",

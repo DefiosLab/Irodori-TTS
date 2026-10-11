@@ -235,17 +235,17 @@ def build_context_attention_plan(
     kv_mask = segment_masks[0] if len(segment_masks) == 1 else torch.cat(segment_masks, dim=1)
     device = kv_mask.device
     if not fa3_usable(device, attention_dtype):
-        return ContextAttentionPlan(kv_mask=kv_mask, query_len=int(query_len), use_fa3=False)
+        return ContextAttentionPlan(kv_mask=kv_mask, query_len=query_len, use_fa3=False)
     bsz = kv_mask.shape[0]
     pack_index = torch.nonzero(kv_mask.reshape(-1), as_tuple=False).flatten()
     kv_lens = kv_mask.sum(dim=1, dtype=torch.int32)
     cu_k = F.pad(torch.cumsum(kv_lens, dim=0, dtype=torch.int32), (1, 0))
     return ContextAttentionPlan(
         kv_mask=kv_mask,
-        query_len=int(query_len),
+        query_len=query_len,
         use_fa3=True,
         pack_index=pack_index,
-        cu_seqlens_q=_fixed_stride_cu_seqlens(bsz, int(query_len), device),
+        cu_seqlens_q=_fixed_stride_cu_seqlens(bsz, query_len, device),
         cu_seqlens_k=cu_k,
         max_seqlen_k=int(kv_lens.max()),
     )

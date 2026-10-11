@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
 
-from .model import TextToLatentRFDiT
+from .model import EncodedConditionTensors, TextToLatentRFDiT
 from .rf import _make_rng
 
 
@@ -503,6 +504,10 @@ def sample_euler_meanflow(
     speaker_uncond_mode: str = "mask",
     num_steps: int = 4,
     seed: int = 0,
+    use_context_kv_cache: bool = True,
+    velocity_fn: Callable[..., torch.Tensor] | None = None,
+    encoded_conditions: EncodedConditionTensors | None = None,
+    context_kv_cache_fn: Callable[..., list[tuple[torch.Tensor, ...]]] | None = None,
 ) -> torch.Tensor:
     """Linear MeanFlow sampler from Irodori time 1 to 0 (default: 4 NFE)."""
     if str(model.cfg.flow_parameterization).strip().lower() != "meanflow":
@@ -523,8 +528,8 @@ def sample_euler_meanflow(
     if rng_device != device:
         x_t = x_t.to(device=device)
 
-    encoded = EncodedConditions(
-        *model.encode_conditions(
+    if encoded_conditions is None:
+        encoded_conditions = model.encode_conditions(
             text_input_ids=text_input_ids,
             text_mask=text_mask,
             ref_latent=ref_latent,
@@ -535,19 +540,24 @@ def sample_euler_meanflow(
             speaker_mask_override=speaker_mask_override,
             speaker_uncond_mode=speaker_uncond_mode,
         )
-    )
-    context_kv_cache = model.build_context_kv_cache(
-        text_state=encoded.text_state,
-        speaker_state=encoded.speaker_state,
-        caption_state=encoded.caption_state,
-    )
+    encoded = EncodedConditions(*encoded_conditions)
+    context_kv_cache = None
+    if use_context_kv_cache:
+        cache_fn = context_kv_cache_fn or model.build_context_kv_cache
+        context_kv_cache = cache_fn(
+            text_state=encoded.text_state,
+            speaker_state=encoded.speaker_state,
+            caption_state=encoded.caption_state,
+        )
+    if velocity_fn is None:
+        velocity_fn = model.forward_with_encoded_conditions
     schedule = torch.linspace(1.0, 0.0, num_steps + 1, device=device, dtype=torch.float32)
     for index in range(num_steps):
         t_value = schedule[index]
         next_value = schedule[index + 1]
         t_vec = t_value.expand(batch_size)
         delta = (t_value - next_value).expand(batch_size)
-        velocity = model.forward_with_encoded_conditions(
+        velocity = velocity_fn(
             x_t=x_t,
             t=t_vec,
             delta_t=delta,
