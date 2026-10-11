@@ -207,10 +207,13 @@ def _pack_dacvae_polynomials(ov: Any, model: Any) -> dict[str, dict[str, Any]]:
         reduced = squared.input_value(0).get_node()
         value = reduced.input_value(0)
         shape = list(value.get_shape())
-        height = {192: 75, 96: 150}.get(shape[1])
-        if height is None or shape[-1] % (height * 16):
-            continue
-        width = shape[-1] // height
+        batch, channels, length = shape
+        tile_width = math.gcd(length, 16)
+        height_limit = max(1, 230_400 // (batch * channels * 16))
+        height = min(length // tile_width, height_limit)
+        while (length // tile_width) % height:
+            height -= 1
+        width = length // height
         prefix = f"{final.get_friendly_name()}/minimax/"
         scaled_periods = reduced.input_value(1).get_node()
         periods = scaled_periods.input_value(0).get_node()
@@ -275,8 +278,7 @@ def _pack_dacvae_polynomials(ov: Any, model: Any) -> dict[str, dict[str, Any]]:
                 "verticalFusion": "True",
                 "verticalFusionHash": prefix,
                 "VFScenario": "MINIMAL",
-                # 16-wide tiles leave CMX space for q and the live intermediates.
-                "tilingStrategy": {"N": 1, "C": 1, "H": 1, "W": width // 16},
+                "tilingStrategy": {"N": 1, "C": 1, "H": 1, "W": width // tile_width},
             }
     model.validate_nodes_and_infer_types()
     return strategy
