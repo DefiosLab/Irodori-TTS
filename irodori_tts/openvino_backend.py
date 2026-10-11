@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
+import subprocess
+import sys
+import tempfile
 import time
 import warnings
 from abc import ABC, abstractmethod
@@ -185,6 +190,96 @@ def _replace_squared_sine_with_polynomial(ov: Any, model: Any) -> None:
         power_node.output(0).replace(approximation.output(0))
 
     model.validate_nodes_and_infer_types()
+
+
+def _pack_dacvae_polynomials(ov: Any, model: Any) -> dict[str, dict[str, Any]]:
+    op = ov.opset13
+    binary = {"Add": op.add, "Multiply": op.multiply, "Subtract": op.subtract}
+    strategy = {}
+    finals = [
+        node
+        for node in model.get_ordered_ops()
+        if node.get_type_name() == "Multiply"
+        and "/aten.pow.Tensor_Scalar/Power" in node.get_friendly_name()
+    ]
+    for final in finals:
+        squared = final.input_value(0).get_node()
+        reduced = squared.input_value(0).get_node()
+        value = reduced.input_value(0)
+        shape = list(value.get_shape())
+        height = {192: 75, 96: 150}.get(shape[1])
+        if height is None or shape[-1] % (height * 16):
+            continue
+        width = shape[-1] // height
+        prefix = f"{final.get_friendly_name()}/minimax/"
+        scaled_periods = reduced.input_value(1).get_node()
+        periods = scaled_periods.input_value(0).get_node()
+        names = {
+            final: "poly/out",
+            squared: "poly/q",
+            reduced: "range/reduced",
+            scaled_periods: "range/period_pi",
+            periods: "range/round",
+            periods.input_value(0).get_node(): "range/scaled",
+        }
+        polynomial = final.input_value(1).get_node()
+        for index in (2, 1, 0):
+            names[polynomial] = f"poly/add_{index}"
+            product = polynomial.input_value(1).get_node()
+            names[product] = f"poly/mul_{index}"
+            polynomial = product.input_value(1).get_node()
+
+        packed_shape = op.constant(shape[:2] + [height, width], name=prefix + "packed_shape")
+        copied = {value.get_node(): op.reshape(value, packed_shape, False, name=prefix + "pack")}
+
+        def clone(node, copied=copied, names=names, prefix=prefix):
+            if node in copied:
+                return copied[node]
+            kind = node.get_type_name()
+            inputs = [clone(port.get_node()) for port in node.input_values()]
+            if kind == "Constant":
+                result = op.constant(
+                    node.get_data().reshape(1, 1, 1, 1), node.get_output_element_type(0)
+                )
+            elif kind in binary:
+                result = binary[kind](*inputs)
+            elif kind == "Round":
+                result = op.round(inputs[0], node.get_attributes()["mode"])
+            else:
+                raise RuntimeError(f"Unexpected DACVAE polynomial operation: {kind}")
+            result.set_friendly_name(prefix + names.get(node, node.get_friendly_name()))
+            copied[node] = result
+            return result
+
+        original_shape = op.constant(shape, name=prefix + "original_shape")
+        result = op.reshape(clone(final), original_shape, False)
+        result.set_friendly_name(prefix + "restore_shape")
+        result.output(0).set_names(final.output(0).get_names())
+        final.output(0).replace(result.output(0))
+        locations = (
+            "range/scaled?t_Multiply/as_scaleshift",
+            "range/round?t_Round",
+            "range/period_pi?t_Multiply/neg/as_scaleshift",
+            "range/reduced?t_Subtract/as_add",
+            "poly/q?t_Multiply",
+            "poly/add_0?t_Add",
+            "poly/mul_1?t_Multiply",
+            "poly/add_1?t_Add",
+            "poly/mul_2?t_Multiply",
+            "poly/add_2?t_Add",
+            "poly/out?t_Multiply",
+        )
+        for location in locations:
+            strategy[prefix + location] = {
+                "multiClusterStrategy": "SplitOverHeight",
+                "verticalFusion": "True",
+                "verticalFusionHash": prefix,
+                "VFScenario": "MINIMAL",
+                # 16-wide tiles leave CMX space for q and the live intermediates.
+                "tilingStrategy": {"N": 1, "C": 1, "H": 1, "W": width // 16},
+            }
+    model.validate_nodes_and_infer_types()
+    return strategy
 
 
 def _codec_context_frames(model: Any, frame_size: int) -> int:
@@ -1623,6 +1718,37 @@ class OpenVINODACVAEDecoderBackend(_OpenVINODACVAEBackend):
         model = self.ov.convert_model(exported)
         _replace_squared_sine_with_polynomial(self.ov, model)
         return model
+
+    def _compile(self, inputs: tuple[torch.Tensor, ...]):
+        model = self._prepare_model(inputs)
+        strategy = _pack_dacvae_polynomials(self.ov, model) if self.device == "NPU" else {}
+        if not strategy:
+            return self.core.compile_model(model, self.device)
+
+        strategy_json = json.dumps(strategy, sort_keys=True)
+        strategy_hash = hashlib.sha256(strategy_json.encode()).hexdigest()[:16]
+        with tempfile.TemporaryDirectory(prefix="irodori-dacvae-") as directory:
+            root = Path(directory)
+            model_path = root / "model.xml"
+            self.ov.save_model(model, model_path, compress_to_fp16=False)
+            (root / "strategy_in.json").write_text(strategy_json + "\n", encoding="utf-8")
+            # OpenVINO hashes the model and checks compiler/driver compatibility;
+            # its cache key does not include the contents of strategy_in.json.
+            cache_dir = (self._ir_dir or root) / "compiled" / f"dacvae-fusion-{strategy_hash}"
+            config = {
+                "CACHE_DIR": str(cache_dir.resolve()),
+                "CACHE_MODE": "OPTIMIZE_SPEED",
+                "NPU_COMPILATION_MODE_PARAMS": "read-strategy-from-json=true",
+            }
+            (root / "config.json").write_text(json.dumps(config) + "\n", encoding="utf-8")
+            # The compiler reads a fixed relative filename. Isolate its cwd from
+            # the application's other threads, then load the populated OV cache.
+            subprocess.run(
+                [sys.executable, str(Path(__file__).with_name("_openvino_compile.py").resolve())],
+                cwd=root,
+                check=True,
+            )
+            return self.core.compile_model(self.core.read_model(model_path), self.device, config)
 
     def _supports_dynamic_ir(self, inputs: tuple[torch.Tensor, ...]) -> bool:
         return inputs[0].shape[2] <= _MAX_DYNAMIC_SEQUENCE_LENGTH
