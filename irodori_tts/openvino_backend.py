@@ -364,6 +364,90 @@ def _fold_dacvae_dilated_convolutions(ov: Any, model: Any) -> None:
     model.validate_nodes_and_infer_types()
 
 
+def _decompose_dacvae_transposed_convolutions(ov: Any, model: Any) -> None:
+    from openvino.passes import ConstantFolding, Manager
+
+    manager = Manager()
+    manager.register_pass(ConstantFolding())
+    manager.run_passes(model)
+    op = ov.opset13
+    for node in model.get_ordered_ops():
+        if node.get_type_name() != "ConvolutionBackpropData" or node.get_input_size() != 2:
+            continue
+        value, weights = node.input_values()
+        if value.get_partial_shape().is_dynamic or weights.get_node().get_type_name() != "Constant":
+            continue
+        shape = list(value.get_shape())
+        if len(shape) != 3:
+            continue
+        batch, channels, length = shape
+        attrs = node.get_attributes()
+        stride = attrs["strides"][0]
+        padding = stride // 2
+        in_channels, out_channels, kernel = weights.get_shape()
+        if (
+            stride % 2
+            or in_channels != channels
+            or kernel != 2 * stride
+            or attrs["dilations"] != [1]
+            or attrs["pads_begin"] != [padding]
+            or attrs["pads_end"] != [padding]
+            or attrs["auto_pad"] != "explicit"
+            or attrs["output_padding"] != [0]
+        ):
+            continue
+
+        prefix = f"{node.get_friendly_name()}/polyphase/"
+        # Before cropping, y[q*s+r] = W[r]*x[q] + W[s+r]*x[q-1].
+        # Compute the s phases as channels of a two-tap convolution on x,
+        # then interleave them in time; no zero-expanded input is needed.
+        packed_weights = (
+            weights.get_node()
+            .get_data()
+            .reshape(channels, out_channels, 2, stride)
+            .transpose(1, 3, 0, 2)[..., ::-1]
+            .reshape(out_channels * stride, channels, 2)
+            .copy()
+        )
+        conv = op.convolution(
+            value,
+            op.constant(packed_weights, weights.get_element_type(), name=prefix + "weights"),
+            strides=[1],
+            pads_begin=[1],
+            pads_end=[1],
+            dilations=[1],
+            name=prefix + "conv2",
+        )
+        shaped = op.reshape(
+            conv,
+            op.constant([batch, out_channels, stride, length + 1], name=prefix + "channel_shape"),
+            False,
+            name=prefix + "unpack_channels",
+        )
+        interleaved = op.transpose(
+            shaped,
+            op.constant([0, 1, 3, 2], name=prefix + "order"),
+            name=prefix + "interleave",
+        )
+        flat = op.reshape(
+            interleaved,
+            op.constant([batch, out_channels, (length + 1) * stride], name=prefix + "output_shape"),
+            False,
+            name=prefix + "flatten",
+        )
+        result = op.slice(
+            flat,
+            op.constant([padding], name=prefix + "crop_start"),
+            op.constant([padding + length * stride], name=prefix + "crop_stop"),
+            op.constant([1], name=prefix + "crop_step"),
+            op.constant([2], name=prefix + "crop_axis"),
+            name=prefix + "crop",
+        )
+        result.output(0).set_names(node.output(0).get_names())
+        node.output(0).replace(result.output(0))
+    model.validate_nodes_and_infer_types()
+
+
 def _codec_context_frames(model: Any, frame_size: int) -> int:
     # Follow the longest convolution path, including residual branches, in input units.
     fields: dict[Any, tuple[float, float, float]] = {model.input(0).get_node(): (1.0, 0.0, 0.0)}
@@ -1805,6 +1889,7 @@ class OpenVINODACVAEDecoderBackend(_OpenVINODACVAEBackend):
         model = self._prepare_model(inputs)
         strategy = _pack_dacvae_polynomials(self.ov, model)
         _fold_dacvae_dilated_convolutions(self.ov, model)
+        _decompose_dacvae_transposed_convolutions(self.ov, model)
         if not strategy:
             return self.core.compile_model(model, self.device)
 
