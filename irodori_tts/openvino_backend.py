@@ -681,7 +681,9 @@ class _OpenVINOBackendBase(ABC):
     def _compile(self, inputs: tuple[torch.Tensor, ...]):
         return self.core.compile_model(self._prepare_model(inputs), self.device)
 
-    def _get_compiled_model(self, inputs: tuple[torch.Tensor, ...]):
+    def _get_compiled_model(
+        self, inputs: tuple[torch.Tensor, ...], *, valid_frames: int | None = None
+    ):
         signature = tuple((tuple(tensor.shape), tensor.dtype) for tensor in inputs)
         compiled_model = self._compiled_models.get(signature)
         if compiled_model is None:
@@ -747,10 +749,14 @@ class _OpenVINODACVAEBackend(_OpenVINOBackendBase):
         # Retain transformed convolution weights to keep codec compilation inexpensive.
         return "OPTIMIZE_SPEED"
 
-    def _prepare_model(self, inputs: tuple[torch.Tensor, ...]):
+    def _prepare_model(
+        self, inputs: tuple[torch.Tensor, ...], *, mask_boundaries: bool = True
+    ):
         model = super()._prepare_model(inputs)
         self._context_frames = _codec_context_frames(model, self._frame_size)
-        return _mask_codec_boundaries(self.ov, model, inputs[0].shape[-1] // self._frame_size)
+        if mask_boundaries:
+            return _mask_codec_boundaries(self.ov, model, inputs[0].shape[-1] // self._frame_size)
+        return model
 
     def _masked_inputs(
         self,
@@ -791,7 +797,7 @@ class _OpenVINODACVAEBackend(_OpenVINOBackendBase):
                 window = torch.cat((window, padding), dim=-1)
             batch_pieces = []
             for batch_inputs in _iter_batch_inputs((window,)):
-                compiled_model = self._get_compiled_model(batch_inputs)
+                compiled_model = self._get_compiled_model(batch_inputs, valid_frames=valid_frames)
                 if frames > width and width <= 2 * self._context_frames:
                     raise RuntimeError("DACVAE bucket is too short for its convolution context.")
                 inputs = self._masked_inputs(compiled_model, batch_inputs[0], valid_frames)
@@ -1875,6 +1881,12 @@ class OpenVINODACVAEDecoderBackend(_OpenVINODACVAEBackend):
         self.dtype = next(self.model.parameters()).dtype
         self._frame_size = 1
         super().__init__(device=device, checkpoint_path=checkpoint_path)
+        self._unmasked_compiled_models: OrderedDict[
+            tuple[tuple[tuple[int, ...], torch.dtype], ...], Any
+        ] = OrderedDict()
+        self._unmasked_warmed_profiles: set[
+            tuple[tuple[tuple[int, ...], torch.dtype], ...]
+        ] = set()
 
     @property
     def _ir_filename(self) -> str:
@@ -1885,8 +1897,27 @@ class OpenVINODACVAEDecoderBackend(_OpenVINODACVAEBackend):
         _replace_squared_sine_with_polynomial(self.ov, model)
         return model
 
-    def _compile(self, inputs: tuple[torch.Tensor, ...]):
-        model = self._prepare_model(inputs)
+    def _get_compiled_model(
+        self, inputs: tuple[torch.Tensor, ...], *, valid_frames: int | None = None
+    ):
+        if valid_frames != inputs[0].shape[-1]:
+            return super()._get_compiled_model(inputs)
+        signature = tuple((tuple(tensor.shape), tensor.dtype) for tensor in inputs)
+        compiled_model = self._unmasked_compiled_models.get(signature)
+        if compiled_model is None:
+            if (
+                self._resident_model_limit is not None
+                and len(self._unmasked_compiled_models) >= self._resident_model_limit
+            ):
+                self._unmasked_compiled_models.popitem(last=False)
+            compiled_model = self._compile(inputs, mask_boundaries=False)
+            self._unmasked_compiled_models[signature] = compiled_model
+        else:
+            self._unmasked_compiled_models.move_to_end(signature)
+        return compiled_model
+
+    def _compile(self, inputs: tuple[torch.Tensor, ...], *, mask_boundaries: bool = True):
+        model = self._prepare_model(inputs, mask_boundaries=mask_boundaries)
         strategy = _pack_dacvae_polynomials(self.ov, model)
         _fold_dacvae_dilated_convolutions(self.ov, model)
         _decompose_dacvae_transposed_convolutions(self.ov, model)
@@ -1955,6 +1986,19 @@ class OpenVINODACVAEDecoderBackend(_OpenVINODACVAEBackend):
             (parameter.new_zeros((1, latent_dim, frames)),) for frames in _CODEC_DECODER_BUCKETS
         ]
         self._prepare_profiles(profiles, log_fn=log_fn)
+        log = print if log_fn is None else log_fn
+        for inputs in profiles:
+            signature = tuple((tuple(tensor.shape), tensor.dtype) for tensor in inputs)
+            if signature in self._unmasked_warmed_profiles:
+                continue
+            prefix = f"[openvino] {self._ir_filename} unmasked {tuple(inputs[0].shape)}"
+            log(f"{prefix} prepare")
+            started = time.perf_counter()
+            compiled_model = self._get_compiled_model(inputs, valid_frames=inputs[0].shape[-1])
+            self._warmup(compiled_model, inputs)
+            self._unmasked_warmed_profiles.add(signature)
+            log(f"{prefix} ready: load/compile+warmup={time.perf_counter() - started:.2f}s")
+            del compiled_model
 
     def __call__(self, latent: torch.Tensor) -> torch.Tensor:
         if latent.ndim != 3:
