@@ -71,7 +71,7 @@ def main() -> None:
     parser.add_argument(
         "--model-device",
         default=default_runtime_device(),
-        help="Model inference target (e.g. cuda, xpu, mps, cpu, or experimental npu).",
+        help="Model inference target (e.g. cuda, xpu, mps, cpu, or npu).",
     )
     parser.add_argument(
         "--model-precision",
@@ -82,10 +82,7 @@ def main() -> None:
     parser.add_argument(
         "--codec-device",
         default=default_runtime_device(),
-        help=(
-            "Codec target (e.g. cuda, xpu, mps, cpu, or experimental npu; "
-            "npu currently applies to decode only)."
-        ),
+        help="Codec target (e.g. cuda, xpu, mps, cpu, or npu).",
     )
     parser.add_argument(
         "--codec-precision",

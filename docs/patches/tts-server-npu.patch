@@ -1,0 +1,108 @@
+diff --git a/pyproject.toml b/pyproject.toml
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -8,7 +8,7 @@
+ dependencies = [
+     "fastapi>=0.115.0",
+     "huggingface-hub>=0.34.0",
+-    "irodori-tts @ git+https://github.com/Aratako/Irodori-TTS.git",
++    "irodori-tts",
+     "pydantic-settings>=2.6.0",
+     "python-dotenv>=1.0.1",
+     "python-multipart>=0.0.9",
+@@ -28,6 +28,9 @@
+     "torch>=2.10.0,<2.11.0",
+     "torchao>=0.16.0,<0.17.0",
+     "torchaudio>=2.10.0,<2.11.0",
++]
++npu = [
++    "irodori-tts[npu]",
+ ]
+ rocm = [
+     "torch>=2.10.0,<2.11.0",
+@@ -50,18 +53,22 @@
+     [
+         { extra = "cpu" },
+         { extra = "cu128" },
++        { extra = "npu" },
+         { extra = "rocm" },
+     ],
+ ]
+
+ [tool.uv.sources]
++irodori-tts = { path = "../Irodori-TTS", editable = true }
+ torch = [
+     { index = "pytorch-cpu", extra = "cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
++    { index = "pytorch-cpu", extra = "npu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+     { index = "pytorch-cu128", extra = "cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+     { index = "pytorch-rocm", extra = "rocm", marker = "sys_platform == 'linux'" },
+ ]
+ torchaudio = [
+     { index = "pytorch-cpu", extra = "cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
++    { index = "pytorch-cpu", extra = "npu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+     { index = "pytorch-cu128", extra = "cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+     { index = "pytorch-rocm", extra = "rocm", marker = "sys_platform == 'linux'" },
+ ]
+diff --git a/src/irodori_openai_tts/runtime.py b/src/irodori_openai_tts/runtime.py
+--- a/src/irodori_openai_tts/runtime.py
++++ b/src/irodori_openai_tts/runtime.py
+@@ -8,6 +8,7 @@
+ from irodori_tts.inference_runtime import (
+     InferenceRuntime,
+     RuntimeKey,
++    acquire_runtime,
+     default_runtime_device,
+     download_hf_checkpoint,
+ )
+@@ -45,7 +46,7 @@
+                 t0 = time.perf_counter()
+                 self._checkpoint_path = self._resolve_checkpoint_path()
+                 logger.info("checkpoint resolved: %s", self._checkpoint_path)
+-                self._runtime = InferenceRuntime.from_key(
++                self._runtime = acquire_runtime(
+                     RuntimeKey(
+                         checkpoint=self._checkpoint_path,
+                         model_device=self._resolve_device(self.settings.model_device),
+diff --git a/tests/test_runtime.py b/tests/test_runtime.py
+--- a/tests/test_runtime.py
++++ b/tests/test_runtime.py
+@@ -22,13 +22,14 @@
+     assert Settings(_env_file=None).default_num_steps == steps
+
+
+-def test_runtime_load_timeout_while_another_thread_is_loading(tmp_path, monkeypatch):
++@pytest.mark.parametrize("device", ["cpu", "npu"])
++def test_runtime_load_timeout_while_another_thread_is_loading(tmp_path, monkeypatch, device):
+     checkpoint = tmp_path / "model.safetensors"
+     checkpoint.write_bytes(b"test")
+     settings = Settings(
+         checkpoint=str(checkpoint),
+-        model_device="cpu",
+-        codec_device="cpu",
++        model_device=device,
++        codec_device=device,
+         model_load_timeout=0.05,
+         _env_file=None,
+     )
+@@ -38,15 +39,17 @@
+     loaded_runtime = object()
+     errors: list[BaseException] = []
+
+-    def fake_from_key(_key):
++    def fake_acquire_runtime(key):
++        assert key.model_device == device
++        assert key.codec_device == device
+         started.set()
+         release.wait(timeout=2)
+         return loaded_runtime
+
+     monkeypatch.setattr(
+-        runtime_module.InferenceRuntime,
+-        "from_key",
+-        staticmethod(fake_from_key),
++        runtime_module,
++        "acquire_runtime",
++        fake_acquire_runtime,
+     )
+
+     def load_runtime():

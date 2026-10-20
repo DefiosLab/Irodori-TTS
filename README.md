@@ -7,6 +7,7 @@
 Training and inference code for **Irodori-TTS**, a Flow Matching-based Text-to-Speech model. The architecture and training design largely follow [Echo-TTS](https://jordandarefsky.com/blog/2025/echo/), using [DACVAE](https://github.com/facebookresearch/dacvae) continuous latents as the generation target.
 
 For an OpenAI-compatible inference API server, see [Irodori-TTS-Server](https://github.com/Aratako/Irodori-TTS-Server).
+For Intel NPU server setup and the required patch, see the [Server NPU guide](docs/server_npu.md).
 
 > [!IMPORTANT]
 > `main` tracks the **v4/v4.1** codebase, including MeanFlow and the forthcoming v4-Large model.
@@ -29,6 +30,7 @@ For model weights and audio samples, please refer to the [Irodori-TTS-v4.1-Small
 - **PEFT LoRA Fine-Tuning**: Parameter-efficient adaptation with PEFT/LoRA for released checkpoints
 - **Speaker Inversion**: Learn reusable speaker embedding tokens for a target voice while freezing the base model
 - **Flexible Inference**: CLI, Gradio Web UI, and HuggingFace Hub checkpoint support
+- **Intel NPU Inference**: OpenVINO backend for RF/MeanFlow models, DACVAE, and SilentCipher
 
 ## Architecture
 
@@ -54,7 +56,7 @@ cd Irodori-TTS
 uv sync --extra cu128  # NVIDIA CUDA 12.8 (Linux/Windows)
 ```
 
-If you want to explicitly select a PyTorch backend, use one of the backend
+If you want to explicitly select a backend, use one of the backend
 extras below:
 
 ```bash
@@ -67,15 +69,20 @@ uv sync --extra rocm
 # Intel XPU on Linux/Windows
 uv sync --extra xpu
 
+# Intel NPU via OpenVINO
+uv sync --extra npu
+
 # CPU-only, or macOS CPU/MPS via PyPI
 uv sync --extra cpu
 ```
 
-The PyTorch backend extras are mutually exclusive. The `cu128` extra uses the
+The backend extras are mutually exclusive. The `cu128` extra uses the
 PyTorch CUDA 12.8 index, the `rocm` extra uses the PyTorch ROCm index on
 Linux, and the `xpu` extra uses the PyTorch XPU index on Linux/Windows.
 The `cpu` extra uses the CPU PyTorch index on Linux/Windows and falls
 back to the standard PyPI PyTorch wheels on macOS.
+The `npu` extra adds OpenVINO and uses CPU PyTorch wheels on Linux/Windows
+for host-side processing.
 
 After syncing with a backend extra, use `uv run --no-sync ...` for the commands
 below to avoid re-syncing the environment without the selected PyTorch backend
@@ -84,6 +91,13 @@ extra.
 The `rocm` extra includes `pytorch-triton-rocm` because `triton-rocm` alone does
 not provide `triton.language` for the `transformers` to `torch._dynamo` import
 path. This was validated with AMD GPU inference.
+
+NPU inference requires a compatible Intel NPU and its device driver. After syncing
+with `--extra npu`, confirm that `NPU` appears in OpenVINO's available devices:
+
+```bash
+uv run --no-sync python -c "import openvino as ov; print(ov.Core().available_devices)"
+```
 
 ## Quick Start
 
@@ -118,6 +132,47 @@ The hosted [v4.1-Small demo](https://huggingface.co/spaces/Aratako/Irodori-TTS-v
 also supports caption and reference-audio conditioning.
 
 ## Inference
+
+### Intel NPU Inference (OpenVINO)
+
+Use the CLI to select the NPU backend explicitly. NPU is not selected automatically
+and is not listed in the current Gradio device dropdowns.
+
+```bash
+uv run --no-sync python infer.py \
+  --hf-checkpoint Aratako/Irodori-TTS-v4.1-Small \
+  --model-device npu \
+  --codec-device npu \
+  --text "こんにちは、私はAIです。これは音声合成のテストです。" \
+  --ref-wav path/to/reference.wav \
+  --output-wav outputs/sample_npu.wav
+```
+
+The same device options work with `Aratako/Irodori-TTS-v4.1-Small-MF` for MeanFlow
+inference, which defaults to four sampling steps.
+
+`--model-device npu` runs the DiT and pretrained text/caption backbone through
+OpenVINO. `--codec-device npu` runs DACVAE reference encoding, waveform decoding,
+and SilentCipher watermarking through OpenVINO when the watermark model is available.
+Remaining PyTorch operations run on the CPU. The model and codec targets can be
+selected independently, for example `--model-device npu --codec-device cpu`.
+
+NPU preparation exports, compiles, and warms up inference profiles before synthesis.
+The first run can take longer; progress is logged with the `[openvino]` prefix and
+preparation completes with `[openvino] NPU ready (...)`. OpenVINO IR and compiled
+models are cached beside each checkpoint in `<checkpoint-name>.openvino/` and reused
+on later runs. Keep the checkpoint directories writable to retain these caches.
+
+- Keep the corresponding `--model-precision` / `--codec-precision` at `fp32`
+  (the default) for NPU targets. These options control the CPU-side PyTorch weights
+  and floating-point tensors. Floating-point computation on the Intel NPU runs
+  in `fp16`.
+  `bf16` is not supported by the CPU host path.
+- `--compile-model` cannot be combined with `--model-device npu`; OpenVINO handles
+  compilation for that target.
+- Dynamic `--lora-adapter` loading cannot be combined with `--model-device npu`.
+  [Convert the adapter to a merged checkpoint](#6-convert-a-training-checkpoint)
+  before NPU inference.
 
 ### Local Checkpoints
 
@@ -504,8 +559,11 @@ Irodori-TTS/
 ├── quantize_checkpoint.py      # torchao checkpoint quantization
 │
 ├── docs/
-│   ├── meanflow.md           # MeanFlow inference and distillation guide
-│   └── parameters.md         # Detailed parameter guide
+│   ├── meanflow.md             # MeanFlow inference and distillation guide
+│   ├── parameters.md           # Detailed parameter guide
+│   ├── server_npu.md           # Intel NPU setup for Irodori-TTS-Server
+│   └── patches/
+│       └── tts-server-npu.patch  # Server dependency and NPU preparation changes
 │
 ├── irodori_tts/                # Core library
 │   ├── attention.py            # Mask-aware SDPA and optional FlashAttention-3 dispatch
@@ -517,6 +575,7 @@ Irodori-TTS/
 │   ├── tokenizer.py            # Pretrained LLM tokenizer wrapper
 │   ├── config.py               # Model and training config dataclasses
 │   ├── inference_runtime.py    # Cached, thread-safe inference runtime
+│   ├── openvino_backend.py     # Intel NPU inference via OpenVINO
 │   ├── lora.py                 # PEFT LoRA integration helpers
 │   ├── quantization.py         # torchao checkpoint serialization/load helpers
 │   ├── speaker_inversion.py    # Speaker Inversion embedding save/load helpers
